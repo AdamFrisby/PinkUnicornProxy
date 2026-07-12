@@ -1,0 +1,23 @@
+## .NET build output
+bin/
+obj/
+artifacts/
+TestResults/
+
+## IDEs and local tooling
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+
+## Local configuration and secrets
+appsettings.Local.json
+.env
+.env.*
+!.env.example
+
+## Operating systems
+.DS_Store
+Thumbs.db

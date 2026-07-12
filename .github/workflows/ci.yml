@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: "**/packages.lock.json"
+
+      - name: Restore
+        run: dotnet restore PinkUnicornProxy.sln --locked-mode
+
+      - name: Build
+        run: dotnet build PinkUnicornProxy.sln --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test PinkUnicornProxy.sln --configuration Release --no-build --no-restore
+
+      - name: Verify formatting
+        run: dotnet format PinkUnicornProxy.sln --verify-no-changes --no-restore
+
+      - name: Build container
+        run: docker build --tag pink-unicorn-proxy:ci .
