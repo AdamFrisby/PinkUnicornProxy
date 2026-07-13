@@ -1,14 +1,20 @@
 # Pink Unicorn Proxy
 
-Pink Unicorn Proxy is an experimental OpenAI/Anthropic HTTP endpoint that uses a small auxiliary LLM to rewrite corrected assumptions out of the complete conversation history before the request reaches the primary model.
+> Don't think of the invisible pink unicorn.
+>
+> Now there is a pink unicorn in your head.
 
-The motivating failure mode is the invisible pink unicorn problem: once a model has committed to a bad cause, both the cause and the user's later negation keep that cause salient. A marked correction such as:
+AI has a similar problem. Merely putting an idea into the conversation can make it salient, even when the only reason it was mentioned was to reject it. If an agent suggests DNS and the user replies, "No, it is not DNS," then DNS is still in the context. The model can keep circling back to that irrelevant fault because every later negation reminds it of the same idea.
+
+Pink Unicorn Proxy removes corrected assumptions and the reasoning that led to them from the supplied conversation history. Instead of appending another negative instruction, it rewrites the history so the discarded idea is absent and the real issue is stated affirmatively. The primary model then receives cleaner context and can refocus on the actual evidence or cause.
+
+It exposes OpenAI- and Anthropic-compatible HTTP endpoints. When the user marks a correction such as:
 
 ```text
 !!NO!! The failure is caused by the expired certificate.
 ```
 
-causes the proxy to ask a separately configured rewriter model for edits across the entire supplied history. The correction becomes an affirmative fact, and earlier user/assistant text that led toward the rejected conclusion can be rewritten at the same time.
+the proxy asks a separately configured lightweight LLM to edit the entire supplied history—not just the latest message. Earlier user and assistant text that introduced or reinforced the bad conclusion can be rewritten at the same time.
 
 ```text
 client ──► /openai/*    ──► configured OpenAI origin
