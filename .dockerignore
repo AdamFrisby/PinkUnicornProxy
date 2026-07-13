@@ -7,5 +7,6 @@
 **/TestResults
 artifacts
 tests
+data
 *.user
 *.suo

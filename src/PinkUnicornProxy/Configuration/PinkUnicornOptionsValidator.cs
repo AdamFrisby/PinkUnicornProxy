@@ -15,14 +15,9 @@ internal sealed class PinkUnicornOptionsValidator : IValidateOptions<PinkUnicorn
             failures.Add("MaximumRequestBodyBytes must be between 1 KiB and 16 MiB.");
         }
 
-        if (options.MaximumCorrectionTextCharacters is < 128 or > 1024 * 1024)
+        if (options.MaximumEditsPerRequest is < 1 or > 1_000)
         {
-            failures.Add("MaximumCorrectionTextCharacters must be between 128 and 1,048,576.");
-        }
-
-        if (options.MaximumCorrectionsPerRequest is < 1 or > 1_000)
-        {
-            failures.Add("MaximumCorrectionsPerRequest must be between 1 and 1,000.");
+            failures.Add("MaximumEditsPerRequest must be between 1 and 1,000.");
         }
 
         if (options.MaximumConcurrentRequests is < 1 or > 10_000)
@@ -33,11 +28,6 @@ internal sealed class PinkUnicornOptionsValidator : IValidateOptions<PinkUnicorn
         if (!Enum.IsDefined(options.Mode))
         {
             failures.Add("Mode is not a defined ProxyMode value.");
-        }
-
-        if (!Enum.IsDefined(options.StatefulResponsesPolicy))
-        {
-            failures.Add("StatefulResponsesPolicy is not a defined value.");
         }
 
         if (options.AccessToken is { Length: > 0 and < 16 })
@@ -55,6 +45,8 @@ internal sealed class PinkUnicornOptionsValidator : IValidateOptions<PinkUnicorn
             failures.Add("ConnectTimeout must be positive.");
         }
 
+        ValidateHistoryRewrite(options, failures);
+
         ValidateOrigin(nameof(options.Upstreams.OpenAI), options.Upstreams.OpenAI, options, failures);
         ValidateOrigin(nameof(options.Upstreams.Anthropic), options.Upstreams.Anthropic, options, failures);
 
@@ -62,6 +54,165 @@ internal sealed class PinkUnicornOptionsValidator : IValidateOptions<PinkUnicorn
             ? ValidateOptionsResult.Success
             : ValidateOptionsResult.Fail(failures);
     }
+
+    private static void ValidateHistoryRewrite(
+        PinkUnicornOptions options,
+        List<string> failures)
+    {
+        HistoryRewriteOptions rewrite = options.HistoryRewrite;
+        if (!Enum.IsDefined(rewrite.Protocol))
+        {
+            failures.Add("HistoryRewrite:Protocol is not a defined value.");
+        }
+
+        if (!Enum.IsDefined(rewrite.OpenAIOutputTokenParameter))
+        {
+            failures.Add("HistoryRewrite:OpenAIOutputTokenParameter is not a defined value.");
+        }
+
+        if (rewrite.TriggerTokens is { Length: > 0 })
+        {
+            HashSet<string> tokens = new(StringComparer.Ordinal);
+            foreach (string? token in rewrite.TriggerTokens)
+            {
+                if (string.IsNullOrWhiteSpace(token) || token.Length > 256)
+                {
+                    failures.Add("Each history rewrite trigger token must contain 1 to 256 non-whitespace characters.");
+                }
+                else if (!tokens.Add(token))
+                {
+                    failures.Add($"HistoryRewrite:TriggerTokens contains the duplicate token '{token}'.");
+                }
+            }
+        }
+
+        bool hasEndpoint = !string.IsNullOrWhiteSpace(rewrite.Endpoint);
+        bool hasModel = !string.IsNullOrWhiteSpace(rewrite.Model);
+        if (hasEndpoint != hasModel)
+        {
+            failures.Add("HistoryRewrite:Endpoint and HistoryRewrite:Model must be configured together.");
+        }
+
+        if (hasEndpoint)
+        {
+            if (!Uri.TryCreate(rewrite.Endpoint, UriKind.Absolute, out Uri? endpoint)
+                || (endpoint.Scheme != Uri.UriSchemeHttps && endpoint.Scheme != Uri.UriSchemeHttp)
+                || !string.IsNullOrEmpty(endpoint.Fragment))
+            {
+                failures.Add("HistoryRewrite:Endpoint must be an absolute HTTP(S) URL without a fragment.");
+            }
+            else
+            {
+                if (!string.IsNullOrEmpty(endpoint.UserInfo))
+                {
+                    failures.Add("HistoryRewrite:Endpoint must not contain URI user information.");
+                }
+
+                bool loopback = endpoint.IsLoopback
+                    || endpoint.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+                    || endpoint.Host.EndsWith(".localhost", StringComparison.OrdinalIgnoreCase);
+                if (endpoint.Scheme == Uri.UriSchemeHttp
+                    && !loopback
+                    && !options.AllowInsecureUpstreams)
+                {
+                    failures.Add("HistoryRewrite:Endpoint must use HTTPS unless it is loopback or AllowInsecureUpstreams is enabled.");
+                }
+            }
+        }
+
+        if (rewrite.Timeout <= TimeSpan.Zero || rewrite.Timeout > TimeSpan.FromMinutes(10))
+        {
+            failures.Add("HistoryRewrite:Timeout must be positive and no longer than 10 minutes.");
+        }
+
+        if (rewrite.MaximumOutputTokens is < 64 or > 1_000_000)
+        {
+            failures.Add("HistoryRewrite:MaximumOutputTokens must be between 64 and 1,000,000.");
+        }
+
+        if (rewrite.MaximumPlannerRequestBytes is < 16 * 1024 or > 64 * 1024 * 1024)
+        {
+            failures.Add("HistoryRewrite:MaximumPlannerRequestBytes must be between 16 KiB and 64 MiB.");
+        }
+
+        if (rewrite.MaximumResponseBodyBytes is < 1024 or > 16 * 1024 * 1024)
+        {
+            failures.Add("HistoryRewrite:MaximumResponseBodyBytes must be between 1 KiB and 16 MiB.");
+        }
+
+        if (string.IsNullOrWhiteSpace(rewrite.AnthropicVersion)
+            || rewrite.AnthropicVersion.Any(char.IsControl))
+        {
+            failures.Add("HistoryRewrite:AnthropicVersion must be a non-empty header value.");
+        }
+
+        ValidateCache(rewrite.Cache, failures);
+
+        string[] forbiddenHeaders =
+        [
+            "Content-Length",
+            "Host",
+            "Transfer-Encoding",
+            HistoryRewriteOptions.InternalRequestHeaderName,
+        ];
+        foreach ((string name, string value) in rewrite.Headers)
+        {
+            if (string.IsNullOrWhiteSpace(name)
+                || name.Any(character => !IsHeaderTokenCharacter(character))
+                || value.Any(char.IsControl))
+            {
+                failures.Add("HistoryRewrite:Headers contains an invalid header name or value.");
+            }
+            else if (forbiddenHeaders.Contains(name, StringComparer.OrdinalIgnoreCase))
+            {
+                failures.Add($"HistoryRewrite:Headers must not configure {name}.");
+            }
+        }
+    }
+
+    private static void ValidateCache(
+        HistoryRewriteCacheOptions cache,
+        List<string> failures)
+    {
+        if (string.IsNullOrWhiteSpace(cache.DatabasePath)
+            || cache.DatabasePath.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
+        {
+            failures.Add("HistoryRewrite:Cache:DatabasePath must be a valid non-empty file path.");
+        }
+
+        if (cache.Generation < 1)
+        {
+            failures.Add("HistoryRewrite:Cache:Generation must be at least 1.");
+        }
+
+        if (cache.MaximumBytes is < 64L * 1024 * 1024 or > 1024L * 1024 * 1024 * 1024)
+        {
+            failures.Add("HistoryRewrite:Cache:MaximumBytes must be between 64 MiB and 1 TiB.");
+        }
+
+        if (cache.TimeToLive < TimeSpan.FromSeconds(1)
+            || cache.TimeToLive > TimeSpan.FromDays(365))
+        {
+            failures.Add("HistoryRewrite:Cache:TimeToLive must be between 1 second and 365 days.");
+        }
+
+        if (cache.CleanupInterval < TimeSpan.FromSeconds(1)
+            || cache.CleanupInterval > TimeSpan.FromDays(1))
+        {
+            failures.Add("HistoryRewrite:Cache:CleanupInterval must be between 1 second and 1 day.");
+        }
+
+        if (cache.BusyTimeout < TimeSpan.FromMilliseconds(100)
+            || cache.BusyTimeout > TimeSpan.FromMinutes(1))
+        {
+            failures.Add("HistoryRewrite:Cache:BusyTimeout must be between 100 milliseconds and 1 minute.");
+        }
+    }
+
+    private static bool IsHeaderTokenCharacter(char character) =>
+        char.IsAsciiLetterOrDigit(character)
+        || character is '!' or '#' or '$' or '%' or '&' or '\'' or '*' or '+' or '-'
+            or '.' or '^' or '_' or '`' or '|' or '~';
 
     private static void ValidateOrigin(
         string name,

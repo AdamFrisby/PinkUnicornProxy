@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.RateLimiting;
@@ -16,17 +17,19 @@ int maximumConcurrentRequests = Math.Clamp(
 builder.Services
     .AddOptions<PinkUnicornOptions>()
     .Bind(builder.Configuration.GetSection(PinkUnicornOptions.SectionName))
+    .PostConfigure(options =>
+    {
+        if (options.HistoryRewrite.TriggerTokens.Length == 0)
+        {
+            options.HistoryRewrite.TriggerTokens = ["!!NO!!"];
+        }
+    })
     .ValidateOnStart();
 builder.Services.AddSingleton<IValidateOptions<PinkUnicornOptions>, PinkUnicornOptionsValidator>();
 builder.Services.AddHttpForwarder();
 builder.Services.AddRateLimiter(rateLimiter =>
 {
     rateLimiter.RejectionStatusCode = StatusCodes.Status503ServiceUnavailable;
-    rateLimiter.OnRejected = static (context, _) =>
-    {
-        context.HttpContext.Response.Headers[ProviderProxy.ResultHeader] = "concurrency-limit";
-        return ValueTask.CompletedTask;
-    };
     rateLimiter.AddConcurrencyLimiter("provider-proxy", limiter =>
     {
         limiter.PermitLimit = maximumConcurrentRequests;
@@ -34,6 +37,20 @@ builder.Services.AddRateLimiter(rateLimiter =>
         limiter.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
     });
 });
+builder.Services.AddHttpClient("history-rewriter", client =>
+{
+    client.Timeout = Timeout.InfiniteTimeSpan;
+}).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+{
+    AllowAutoRedirect = false,
+    ActivityHeadersPropagator = DistributedContextPropagator.CreateNoOutputPropagator(),
+    AutomaticDecompression = DecompressionMethods.None,
+    UseCookies = false,
+});
+builder.Services.AddSingleton<IHistoryEditPlanner, LlmHistoryEditPlanner>();
+builder.Services.AddSingleton<HistoryRewriteCache>();
+builder.Services.AddHostedService(static serviceProvider =>
+    serviceProvider.GetRequiredService<HistoryRewriteCache>());
 builder.Services.AddSingleton<ConversationRewriter>();
 builder.Services.AddSingleton<ProviderProxy>();
 builder.Services.AddSingleton(static serviceProvider =>
@@ -64,7 +81,12 @@ app.MapGet("/", () => Results.Ok(new
 }));
 
 app.MapGet("/health/live", () => Results.Ok(new { status = "ok" }));
-app.MapGet("/health/ready", () => Results.Ok(new { status = "ready" }));
+app.MapGet("/health/ready", (HistoryRewriteCache cache) =>
+    cache.IsHealthy
+        ? Results.Json(new { status = "ready" })
+        : Results.Json(
+            new { status = "degraded", reason = "history-rewrite-cache" },
+            statusCode: StatusCodes.Status503ServiceUnavailable));
 
 app.Map("/openai/{**path}", static context =>
     context.RequestServices.GetRequiredService<ProviderProxy>().ForwardOpenAIAsync(context))

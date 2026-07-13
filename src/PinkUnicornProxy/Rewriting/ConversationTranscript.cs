@@ -40,18 +40,25 @@ internal sealed class ConversationTranscript
     private ConversationTranscript(
         ProviderRequestKind provider,
         JsonObject root,
+        string historyPropertyName,
         JsonArray? itemArray,
         List<TranscriptTurn> turns,
         bool isStateful)
     {
         Provider = provider;
         this.root = root;
+        HistoryPropertyName = historyPropertyName;
         this.itemArray = itemArray;
         Turns = turns;
         IsStateful = isStateful;
     }
 
     public ProviderRequestKind Provider { get; }
+
+    public string HistoryPropertyName { get; }
+
+    public JsonNode HistoryNode => root[HistoryPropertyName]
+        ?? throw new InvalidOperationException("The transcript history is no longer attached.");
 
     public IReadOnlyList<TranscriptTurn> Turns { get; }
 
@@ -73,163 +80,489 @@ internal sealed class ConversationTranscript
 
     public bool HasActiveAtomicSuffix()
     {
-        TranscriptTurn? latestAssistant = Turns
-            .Where(turn => turn.IsAttached && turn.Role == "assistant")
-            .LastOrDefault();
-
-        if (Provider != ProviderRequestKind.OpenAIResponses)
+        return Provider switch
         {
-            return latestAssistant?.HasOpenToolUse == true;
-        }
+            ProviderRequestKind.OpenAIChatCompletions => HasActiveChatTransaction(),
+            ProviderRequestKind.AnthropicMessages => HasActiveAnthropicTransaction(),
+            ProviderRequestKind.OpenAIResponses => HasActiveOpenAIResponsesTransaction(),
+            _ => false,
+        };
+    }
 
+    private bool HasActiveChatTransaction()
+    {
         if (itemArray is null)
         {
             return false;
         }
 
-        int latestAssistantIndex = latestAssistant?.OriginalIndex ?? -1;
-        for (int index = latestAssistantIndex + 1; index < itemArray.Count; index++)
+        HashSet<string> outstandingCalls = new(StringComparer.Ordinal);
+        bool legacyFunctionCallIsOpen = false;
+        bool awaitingAssistantAfterResult = false;
+        bool malformed = false;
+        foreach (JsonNode? node in itemArray)
         {
-            if (itemArray[index] is not JsonObject item
-                || !TryGetString(item, "type", out string type))
+            if (node is not JsonObject message
+                || !TryGetString(message, "role", out string role))
             {
                 continue;
             }
 
-            if (IsActiveOpenAIResponseItem(item, type))
+            if (role == "assistant")
+            {
+                malformed |= outstandingCalls.Count > 0 || legacyFunctionCallIsOpen;
+                if (outstandingCalls.Count == 0 && !legacyFunctionCallIsOpen)
+                {
+                    awaitingAssistantAfterResult = false;
+                }
+
+                if (message["tool_calls"] is JsonArray calls)
+                {
+                    foreach (JsonNode? callNode in calls)
+                    {
+                        if (callNode is not JsonObject call
+                            || !TryGetString(call, "id", out string callId)
+                            || !outstandingCalls.Add(callId))
+                        {
+                            malformed = true;
+                        }
+                    }
+                }
+
+                if (message["function_call"] is not null)
+                {
+                    malformed |= legacyFunctionCallIsOpen;
+                    legacyFunctionCallIsOpen = true;
+                }
+            }
+            else if (role == "tool")
+            {
+                if (!TryGetString(message, "tool_call_id", out string callId)
+                    || !outstandingCalls.Remove(callId))
+                {
+                    malformed = true;
+                }
+                else
+                {
+                    awaitingAssistantAfterResult = true;
+                }
+            }
+            else if (role == "function")
+            {
+                if (!legacyFunctionCallIsOpen)
+                {
+                    malformed = true;
+                }
+
+                legacyFunctionCallIsOpen = false;
+                awaitingAssistantAfterResult = true;
+            }
+        }
+
+        return malformed
+            || legacyFunctionCallIsOpen
+            || awaitingAssistantAfterResult
+            || outstandingCalls.Count > 0;
+    }
+
+    private bool HasActiveAnthropicTransaction()
+    {
+        if (itemArray is null)
+        {
+            return false;
+        }
+
+        HashSet<string> outstandingClientUses = new(StringComparer.Ordinal);
+        HashSet<string> outstandingServerUses = new(StringComparer.Ordinal);
+        bool awaitingAssistantAfterResult = false;
+        bool malformed = false;
+        foreach (JsonNode? node in itemArray)
+        {
+            if (node is not JsonObject message
+                || !TryGetString(message, "role", out string role))
+            {
+                continue;
+            }
+
+            if (role == "assistant")
+            {
+                malformed |= outstandingClientUses.Count > 0;
+                if (outstandingClientUses.Count == 0)
+                {
+                    awaitingAssistantAfterResult = false;
+                }
+            }
+
+            if (message["content"] is not JsonArray content)
+            {
+                continue;
+            }
+
+            foreach (JsonNode? blockNode in content)
+            {
+                if (blockNode is not JsonObject block
+                    || !TryGetString(block, "type", out string type))
+                {
+                    continue;
+                }
+
+                if (type == "tool_use")
+                {
+                    if (!TryGetString(block, "id", out string useId)
+                        || !outstandingClientUses.Add(useId))
+                    {
+                        malformed = true;
+                    }
+                }
+                else if (type == "tool_result")
+                {
+                    if (!TryGetString(block, "tool_use_id", out string useId)
+                        || !outstandingClientUses.Remove(useId))
+                    {
+                        malformed = true;
+                    }
+                    else
+                    {
+                        awaitingAssistantAfterResult = true;
+                    }
+                }
+                else if (type.EndsWith("_tool_use", StringComparison.Ordinal))
+                {
+                    if (!TryGetString(block, "id", out string useId)
+                        || !outstandingServerUses.Add(useId))
+                    {
+                        malformed = true;
+                    }
+                }
+                else if (type.EndsWith("_tool_result", StringComparison.Ordinal))
+                {
+                    if (!TryGetString(block, "tool_use_id", out string useId)
+                        || !outstandingServerUses.Remove(useId))
+                    {
+                        malformed = true;
+                    }
+                }
+            }
+        }
+
+        return malformed
+            || awaitingAssistantAfterResult
+            || outstandingClientUses.Count > 0
+            || outstandingServerUses.Count > 0;
+    }
+
+    private bool HasActiveOpenAIResponsesTransaction()
+    {
+        if (itemArray is null)
+        {
+            return false;
+        }
+
+        int latestAssistantIndex = Turns
+            .Where(turn => turn.IsAttached && turn.Role == "assistant")
+            .Select(turn => turn.OriginalIndex)
+            .DefaultIfEmpty(-1)
+            .Max();
+        HashSet<string> outstandingCalls = new(StringComparer.Ordinal);
+        HashSet<string> outstandingApprovals = new(StringComparer.Ordinal);
+        bool awaitingAssistantAfterOutput = false;
+        bool malformed = false;
+        bool trailingReasoning = false;
+        for (int index = 0; index < itemArray.Count; index++)
+        {
+            if (itemArray[index] is not JsonObject item)
+            {
+                continue;
+            }
+
+            if (TryGetString(item, "role", out string role) && role == "assistant")
+            {
+                malformed |= outstandingCalls.Count > 0 || outstandingApprovals.Count > 0;
+                if (outstandingCalls.Count == 0 && outstandingApprovals.Count == 0)
+                {
+                    awaitingAssistantAfterOutput = false;
+                }
+            }
+
+            if (!TryGetString(item, "type", out string type))
+            {
+                continue;
+            }
+
+            if (type == "reasoning" && index > latestAssistantIndex)
+            {
+                trailingReasoning = true;
+                continue;
+            }
+
+            if (type == "mcp_approval_request")
+            {
+                if (!TryGetString(item, "id", out string approvalId)
+                    || !outstandingApprovals.Add(approvalId))
+                {
+                    malformed = true;
+                }
+
+                continue;
+            }
+
+            if (type == "mcp_approval_response")
+            {
+                if (!TryGetString(item, "approval_request_id", out string approvalId)
+                    || !outstandingApprovals.Remove(approvalId))
+                {
+                    malformed = true;
+                }
+                else
+                {
+                    awaitingAssistantAfterOutput = true;
+                }
+
+                continue;
+            }
+
+            if (type.EndsWith("_call_output", StringComparison.Ordinal))
+            {
+                if ((!TryGetString(item, "call_id", out string callId)
+                        && !TryGetString(item, "id", out callId))
+                    || !outstandingCalls.Remove(callId))
+                {
+                    malformed = true;
+                }
+                else
+                {
+                    awaitingAssistantAfterOutput = true;
+                }
+
+                continue;
+            }
+
+            if (!type.EndsWith("_call", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (OpenAIClientManagedCallTypes.Contains(type))
+            {
+                if ((!TryGetString(item, "call_id", out string callId)
+                        && !TryGetString(item, "id", out callId))
+                    || !outstandingCalls.Add(callId))
+                {
+                    malformed = true;
+                }
+
+                continue;
+            }
+
+            if (!TryGetString(item, "status", out string status)
+                || (status != "completed" && status != "failed"))
             {
                 return true;
             }
         }
 
-        return false;
+        return malformed
+            || trailingReasoning
+            || awaitingAssistantAfterOutput
+            || outstandingCalls.Count > 0
+            || outstandingApprovals.Count > 0;
     }
 
-    private static bool IsActiveOpenAIResponseItem(JsonObject item, string type)
+    public PlanningTargetSet CreatePlanningTargets(
+        IReadOnlyList<string> triggerTokens,
+        int targetIndexOffset = 0)
     {
-        if (type == "reasoning" || type.EndsWith("_call_output", StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        if (!type.EndsWith("_call", StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        if (OpenAIClientManagedCallTypes.Contains(type))
-        {
-            return true;
-        }
-
-        return !TryGetString(item, "status", out string status)
-            || (status != "completed" && status != "failed");
-    }
-
-    public ScrubSummary ScrubRejectedClaim(TranscriptTurn correction, string rejectedClaim)
-    {
-        int edits = 0;
-        bool protectedMatch = false;
+        List<HistoryTextTarget> targets = [];
+        HashSet<int> triggerTurnIndices = [];
+        int triggerCount = 0;
+        bool protectedTrigger = false;
 
         foreach (TranscriptTurn turn in Turns)
         {
-            bool isEarlierHumanOrAssistant = turn.OriginalIndex < correction.OriginalIndex
-                && (turn.Role == "user" || turn.Role == "assistant");
-            bool isLaterAssistant = turn.OriginalIndex > correction.OriginalIndex
-                && turn.Role == "assistant";
-
-            if (!turn.IsAttached || (!isEarlierHumanOrAssistant && !isLaterAssistant))
+            if (!turn.IsAttached || (turn.Role != "user" && turn.Role != "assistant"))
             {
                 continue;
             }
 
-            foreach (TextSlot slot in turn.TextSlots.ToArray())
+            for (int slotIndex = 0; slotIndex < turn.TextSlots.Count; slotIndex++)
             {
+                TextSlot slot = turn.TextSlots[slotIndex];
                 if (!slot.IsAttached)
                 {
                     continue;
                 }
 
-                ScrubResult scrub = TextScrubber.RemoveClaim(slot.Text, rejectedClaim);
-                protectedMatch |= scrub.ProtectedMatchFound;
-                if (!scrub.Changed)
+                bool containsTrigger = turn.Role == "user"
+                    && ContainsAny(slot.Text, triggerTokens);
+                if (containsTrigger)
                 {
-                    continue;
+                    triggerCount++;
+                    triggerTurnIndices.Add(turn.OriginalIndex);
+                    protectedTrigger |= slot.HasTextDependentMetadata;
                 }
 
-                if (slot.HasTextDependentMetadata)
+                if (!slot.HasTextDependentMetadata)
                 {
-                    protectedMatch = true;
-                    continue;
-                }
-
-                edits++;
-                if (scrub.Text.Length == 0)
-                {
-                    slot.Remove();
-                }
-                else
-                {
-                    slot.Set(scrub.Text);
+                    targets.Add(new HistoryTextTarget(
+                        GetTargetId(turn, slotIndex, targetIndexOffset),
+                        checked(turn.OriginalIndex + targetIndexOffset),
+                        turn.Role,
+                        containsTrigger));
                 }
             }
-
-            RemoveIfEmpty(turn);
         }
 
-        return new ScrubSummary(edits, protectedMatch);
+        return new PlanningTargetSet(
+            targets,
+            triggerTurnIndices.Order().ToArray(),
+            triggerCount,
+            protectedTrigger);
     }
 
-    public RemoveTurnResult RemovePreviousAssistant(TranscriptTurn correction)
+    public ApplyHistoryEditResult ApplyPlan(
+        HistoryEditPlan plan,
+        IReadOnlyList<string> triggerTokens,
+        int maximumEdits,
+        int maximumReplacementCharacters,
+        int targetIndexOffset = 0,
+        bool requireTriggeredTargets = true,
+        bool allowNoMaterialEdits = false)
     {
-        TranscriptTurn? previousAssistant = Turns
-            .Where(turn => turn.OriginalIndex < correction.OriginalIndex)
-            .Where(turn => turn.IsAttached && turn.Role == "assistant")
-            .LastOrDefault();
-
-        if (previousAssistant is null)
+        if (plan.Edits.Count > maximumEdits)
         {
-            return RemoveTurnResult.NoTarget;
+            return new ApplyHistoryEditResult(ApplyHistoryEditOutcome.EditLimitExceeded, 0, 0);
         }
 
-        if (!previousAssistant.CanRemoveAtomically)
+        Dictionary<string, EditableTarget> targets = CreateEditableTargetMap(
+            triggerTokens,
+            targetIndexOffset);
+        HashSet<string> editedIds = new(StringComparer.Ordinal);
+        List<(EditableTarget Target, string? Replacement)> pending = [];
+        int materialEdits = 0;
+
+        foreach (HistoryEdit edit in plan.Edits)
         {
-            return RemoveTurnResult.Protected;
-        }
-
-        previousAssistant.Remove();
-        return RemoveTurnResult.Removed;
-    }
-
-    public static int ReplaceCorrectionText(TranscriptTurn correction, string affirmativeText)
-    {
-        TextSlot? first = correction.TextSlots.FirstOrDefault(slot => slot.IsAttached);
-        if (first is null)
-        {
-            return 0;
-        }
-
-        int edits = 1;
-        first.Set(affirmativeText);
-
-        foreach (TextSlot extra in correction.TextSlots.Where(slot => slot != first).ToArray())
-        {
-            if (extra.IsAttached)
+            if (!targets.TryGetValue(edit.Id, out EditableTarget? target)
+                || !editedIds.Add(edit.Id)
+                || (edit.Replacement is null && !target.Slot.CanRemoveSafely)
+                || (edit.Replacement is not null
+                    && (string.IsNullOrWhiteSpace(edit.Replacement)
+                        || edit.Replacement.Length > maximumReplacementCharacters
+                        || ContainsAny(edit.Replacement, triggerTokens)))
+                || (target.ContainsTrigger && string.IsNullOrWhiteSpace(edit.Replacement)))
             {
-                extra.Remove();
-                edits++;
+                return new ApplyHistoryEditResult(ApplyHistoryEditOutcome.Unsafe, 0, 0);
+            }
+
+            pending.Add((target, edit.Replacement));
+            materialEdits += string.Equals(
+                target.Slot.Text,
+                edit.Replacement,
+                StringComparison.Ordinal) ? 0 : 1;
+        }
+
+        if ((!allowNoMaterialEdits && materialEdits == 0)
+            || (requireTriggeredTargets
+                && targets.Values.Any(target =>
+                    target.ContainsTrigger && !editedIds.Contains(target.Id))))
+        {
+            return new ApplyHistoryEditResult(ApplyHistoryEditOutcome.Unsafe, 0, 0);
+        }
+
+        bool emptiesContentArray = pending
+            .Where(item => item.Replacement is null)
+            .GroupBy(item => item.Target.Slot.BlockParent)
+            .Any(group =>
+            {
+                if (group.Key is null)
+                {
+                    return true;
+                }
+
+                HashSet<JsonNode> removed = group
+                    .Select(item => (JsonNode)item.Target.Slot.Owner)
+                    .ToHashSet();
+                return !group.Key.Any(node =>
+                    node is not null
+                    && !removed.Contains(node)
+                    && !IsOpaqueContentBlock(node));
+            });
+        if (emptiesContentArray)
+        {
+            return new ApplyHistoryEditResult(ApplyHistoryEditOutcome.Unsafe, 0, 0);
+        }
+
+        foreach ((EditableTarget target, string? replacement) in pending)
+        {
+            if (replacement is null)
+            {
+                target.Slot.Remove();
+            }
+            else
+            {
+                target.Slot.Set(replacement);
             }
         }
 
-        return edits;
+        bool triggerRemains = Turns
+            .Where(turn => turn.IsAttached && turn.Role == "user")
+            .SelectMany(turn => turn.TextSlots)
+            .Any(slot => slot.IsAttached && ContainsAny(slot.Text, triggerTokens));
+        return triggerRemains
+            ? new ApplyHistoryEditResult(ApplyHistoryEditOutcome.Unsafe, 0, 0)
+            : new ApplyHistoryEditResult(
+                ApplyHistoryEditOutcome.Applied,
+                materialEdits,
+                plan.Edits.Count);
     }
 
-    public int ClearStatefulReferences()
+    private Dictionary<string, EditableTarget> CreateEditableTargetMap(
+        IReadOnlyList<string> triggerTokens,
+        int targetIndexOffset)
     {
-        int count = 0;
-        count += root.Remove("previous_response_id") ? 1 : 0;
-        count += root.Remove("conversation") ? 1 : 0;
-        return count;
+        Dictionary<string, EditableTarget> targets = new(StringComparer.Ordinal);
+        foreach (TranscriptTurn turn in Turns)
+        {
+            if (!turn.IsAttached || (turn.Role != "user" && turn.Role != "assistant"))
+            {
+                continue;
+            }
+
+            for (int slotIndex = 0; slotIndex < turn.TextSlots.Count; slotIndex++)
+            {
+                TextSlot slot = turn.TextSlots[slotIndex];
+                if (!slot.IsAttached || slot.HasTextDependentMetadata)
+                {
+                    continue;
+                }
+
+                string id = GetTargetId(turn, slotIndex, targetIndexOffset);
+                targets.Add(id, new EditableTarget(
+                    id,
+                    turn,
+                    slot,
+                    turn.Role == "user" && ContainsAny(slot.Text, triggerTokens)));
+            }
+        }
+
+        return targets;
+    }
+
+    private static string GetTargetId(
+        TranscriptTurn turn,
+        int slotIndex,
+        int targetIndexOffset) =>
+        $"t{checked(turn.OriginalIndex + targetIndexOffset)}.s{slotIndex}";
+
+    private static bool ContainsAny(string text, IReadOnlyList<string> tokens) =>
+        tokens.Any(token => text.Contains(token, StringComparison.Ordinal));
+
+    private bool IsOpaqueContentBlock(JsonNode node)
+    {
+        return Provider == ProviderRequestKind.AnthropicMessages
+            && node is JsonObject block
+            && TryGetString(block, "type", out string type)
+            && (type == "thinking" || type == "redacted_thinking");
     }
 
     public int RemoveOpaqueReasoning()
@@ -339,14 +672,13 @@ internal sealed class ConversationTranscript
                 index,
                 role,
                 slots,
-                hasProtocolStructure,
-                hasToolCalls,
-                role == "tool"));
+                hasProtocolStructure));
         }
 
         transcript = new ConversationTranscript(
             ProviderRequestKind.OpenAIChatCompletions,
             root,
+            "messages",
             messages,
             turns,
             false);
@@ -360,10 +692,11 @@ internal sealed class ConversationTranscript
         if (root["input"] is JsonValue inputValue && inputValue.TryGetValue(out string? _))
         {
             List<TextSlot> slots = [new TextSlot(root, "input")];
-            TranscriptTurn turn = new(root, null, 0, "user", slots, false, false, false);
+            TranscriptTurn turn = new(root, null, 0, "user", slots, false);
             transcript = new ConversationTranscript(
                 ProviderRequestKind.OpenAIResponses,
                 root,
+                "input",
                 null,
                 [turn],
                 isStateful);
@@ -395,14 +728,13 @@ internal sealed class ConversationTranscript
                 index,
                 role,
                 slots,
-                hasNonTextBlocks,
-                false,
-                false));
+                hasNonTextBlocks));
         }
 
         transcript = new ConversationTranscript(
             ProviderRequestKind.OpenAIResponses,
             root,
+            "input",
             input,
             turns,
             isStateful);
@@ -430,25 +762,19 @@ internal sealed class ConversationTranscript
                 message,
                 AnthropicTextBlockTypes,
                 AnthropicOpaqueBlockTypes);
-            bool hasToolUse = HasOpenAnthropicToolUse(message);
-            bool hasToolResult = ContentContainsType(message, static type =>
-                type == "tool_result"
-                || type.EndsWith("_tool_result", StringComparison.Ordinal));
-
             turns.Add(new TranscriptTurn(
                 message,
                 messages,
                 index,
                 role,
                 slots,
-                hasProtocolStructure,
-                hasToolUse,
-                hasToolResult));
+                hasProtocolStructure));
         }
 
         transcript = new ConversationTranscript(
             ProviderRequestKind.AnthropicMessages,
             root,
+            "messages",
             messages,
             turns,
             false);
@@ -506,72 +832,6 @@ internal sealed class ConversationTranscript
         return false;
     }
 
-    private static bool ContentContainsType(JsonObject message, Func<string, bool> predicate)
-    {
-        if (message["content"] is not JsonArray content)
-        {
-            return false;
-        }
-
-        foreach (JsonNode? node in content)
-        {
-            if (node is JsonObject block
-                && TryGetString(block, "type", out string type)
-                && predicate(type))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static bool HasOpenAnthropicToolUse(JsonObject message)
-    {
-        if (message["content"] is not JsonArray content)
-        {
-            return false;
-        }
-
-        HashSet<string> serverToolUses = new(StringComparer.Ordinal);
-        HashSet<string> serverToolResults = new(StringComparer.Ordinal);
-        bool unresolvedServerToolWithoutId = false;
-
-        foreach (JsonNode? node in content)
-        {
-            if (node is not JsonObject block
-                || !TryGetString(block, "type", out string type))
-            {
-                continue;
-            }
-
-            if (type == "tool_use")
-            {
-                return true;
-            }
-
-            if (type.EndsWith("_tool_use", StringComparison.Ordinal))
-            {
-                if (TryGetString(block, "id", out string id))
-                {
-                    serverToolUses.Add(id);
-                }
-                else
-                {
-                    unresolvedServerToolWithoutId = true;
-                }
-            }
-            else if (type.EndsWith("_tool_result", StringComparison.Ordinal)
-                && TryGetString(block, "tool_use_id", out string toolUseId))
-            {
-                serverToolResults.Add(toolUseId);
-            }
-        }
-
-        serverToolUses.ExceptWith(serverToolResults);
-        return unresolvedServerToolWithoutId || serverToolUses.Count > 0;
-    }
-
     private static bool HasValue(JsonObject root, string propertyName) =>
         root.TryGetPropertyValue(propertyName, out JsonNode? value)
         && value is not null
@@ -615,9 +875,7 @@ internal sealed class TranscriptTurn
         int originalIndex,
         string role,
         List<TextSlot> textSlots,
-        bool hasProtocolStructure,
-        bool hasOpenToolUse,
-        bool hasToolResult)
+        bool hasProtocolStructure)
     {
         Node = node;
         Parent = parent;
@@ -625,8 +883,6 @@ internal sealed class TranscriptTurn
         Role = role;
         TextSlots = textSlots;
         HasProtocolStructure = hasProtocolStructure;
-        HasOpenToolUse = hasOpenToolUse;
-        HasToolResult = hasToolResult;
     }
 
     public JsonObject Node { get; }
@@ -641,10 +897,6 @@ internal sealed class TranscriptTurn
 
     public bool HasProtocolStructure { get; }
 
-    public bool HasOpenToolUse { get; }
-
-    public bool HasToolResult { get; }
-
     public bool IsAttached => Parent is null || Node.Parent == Parent;
 
     public bool HasVisibleText => TextSlots.Any(slot => slot.IsAttached && !string.IsNullOrWhiteSpace(slot.Text));
@@ -656,12 +908,7 @@ internal sealed class TranscriptTurn
         _ => false,
     };
 
-    public bool HasProtectedTextSpan => TextSlots.Any(slot =>
-        slot.IsAttached && TextScrubber.ContainsProtectedSpan(slot.Text));
-
     public bool HasProtectedTextMetadata => TextSlots.Any(slot => slot.IsAttached && slot.HasTextDependentMetadata);
-
-    public bool CanRemoveAtomically => Parent is not null && !HasProtocolStructure && !HasProtectedTextSpan;
 
     public string CombinedText => string.Join('\n', TextSlots.Where(slot => slot.IsAttached).Select(slot => slot.Text));
 
@@ -691,6 +938,12 @@ internal sealed class TextSlot
         || owner.ContainsKey("citations")
         || owner.ContainsKey("logprobs");
 
+    public bool CanRemoveSafely => blockParent is { Count: > 1 };
+
+    public JsonArray? BlockParent => blockParent;
+
+    public JsonObject Owner => owner;
+
     public string Text => owner[propertyName] is JsonValue value && value.TryGetValue(out string? text)
         ? text ?? string.Empty
         : string.Empty;
@@ -713,11 +966,26 @@ internal sealed class TextSlot
     }
 }
 
-internal sealed record ScrubSummary(int EditCount, bool ProtectedMatchFound);
+internal sealed record PlanningTargetSet(
+    IReadOnlyList<HistoryTextTarget> Targets,
+    IReadOnlyList<int> TriggerTurnIndices,
+    int TriggerCount,
+    bool HasProtectedTrigger);
 
-internal enum RemoveTurnResult
+internal enum ApplyHistoryEditOutcome
 {
-    NoTarget,
-    Removed,
-    Protected,
+    Applied,
+    Unsafe,
+    EditLimitExceeded,
 }
+
+internal sealed record ApplyHistoryEditResult(
+    ApplyHistoryEditOutcome Outcome,
+    int EditCount,
+    int OperationCount);
+
+internal sealed record EditableTarget(
+    string Id,
+    TranscriptTurn Turn,
+    TextSlot Slot,
+    bool ContainsTrigger);

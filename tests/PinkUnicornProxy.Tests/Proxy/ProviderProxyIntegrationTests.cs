@@ -7,27 +7,28 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
-using PinkUnicornProxy.Proxy;
+using PinkUnicornProxy.Configuration;
+using PinkUnicornProxy.Rewriting;
 
 namespace PinkUnicornProxy.Tests.Proxy;
 
 public sealed class ProviderProxyIntegrationTests
 {
     [Fact]
-    public async Task OpenAIEndpointRewritesAndForwardsToConfiguredOrigin()
+    public async Task TriggeredOpenAIRequestRewritesHistoryAndPreservesEndToEndHeaders()
     {
         RecordingHandler upstream = new();
-        await using WebApplicationFactory<Program> factory = CreateFactory(upstream);
-        using HttpClient client = factory.CreateClient(new WebApplicationFactoryClientOptions
-        {
-            AllowAutoRedirect = false,
-        });
+        FakePlanner planner = new(_ => Success(
+            new HistoryEdit("t0.s0", "It is TLS."),
+            new HistoryEdit("t1.s0", "It is TLS.")));
+        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, planner);
+        using HttpClient client = factory.CreateClient();
         const string requestJson = """
             {
               "model": "gpt-test",
               "messages": [
                 { "role": "assistant", "content": "It is DNS." },
-                { "role": "user", "content": "No, it is not DNS. It is TLS." }
+                { "role": "user", "content": "!!NO!! It is TLS." }
               ]
             }
             """;
@@ -35,32 +36,35 @@ public sealed class ProviderProxyIntegrationTests
         {
             Content = new StringContent(requestJson, Encoding.UTF8, "application/json"),
         };
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", "test-secret");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", "provider-secret");
         request.Headers.TryAddWithoutValidation("X-Forwarded-For", "203.0.113.10");
-        request.Headers.TryAddWithoutValidation("X-Pink-Unicorn-Debug", "do-not-forward");
-        request.Headers.TryAddWithoutValidation("Cookie", "session=do-not-forward");
+        request.Headers.TryAddWithoutValidation("X-Pink-Unicorn-Debug", "preserve-me");
+        request.Headers.TryAddWithoutValidation("Cookie", "session=preserve-me");
 
         using HttpResponseMessage response = await client.SendAsync(request, CancellationToken.None);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        Assert.Equal("rewritten", GetSingleHeader(response, ProviderProxy.ResultHeader));
-        Assert.Equal("1", GetSingleHeader(response, ProviderProxy.CorrectionCountHeader));
         Assert.Equal(new Uri("https://api.openai.com/v1/chat/completions"), upstream.RequestUri);
-        Assert.Equal("Bearer test-secret", upstream.Authorization);
-        Assert.Null(upstream.GetHeader("X-Forwarded-For"));
-        Assert.Null(upstream.GetHeader("X-Pink-Unicorn-Debug"));
-        Assert.Null(upstream.GetHeader("Cookie"));
-        Assert.NotNull(upstream.Body);
-        string forwarded = Encoding.UTF8.GetString(upstream.Body);
+        Assert.Equal("Bearer provider-secret", upstream.Authorization);
+        Assert.Equal("203.0.113.10", upstream.GetHeader("X-Forwarded-For"));
+        Assert.Equal("preserve-me", upstream.GetHeader("X-Pink-Unicorn-Debug"));
+        Assert.Equal("session=preserve-me", upstream.GetHeader("Cookie"));
+        Assert.DoesNotContain(response.Headers, header =>
+            header.Key.StartsWith("X-Pink-Unicorn-", StringComparison.OrdinalIgnoreCase));
+        string forwarded = Encoding.UTF8.GetString(Assert.IsType<byte[]>(upstream.Body));
+        Assert.DoesNotContain("!!NO!!", forwarded, StringComparison.Ordinal);
         Assert.DoesNotContain("DNS", forwarded, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("It is TLS.", forwarded, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task AnthropicEndpointForwardsVendorHeadersAndStripsThinkingOnRewrite()
+    public async Task TriggeredAnthropicRequestForwardsVendorHeadersAndDropsOpaqueThinking()
     {
         RecordingHandler upstream = new();
-        await using WebApplicationFactory<Program> factory = CreateFactory(upstream);
+        FakePlanner planner = new(_ => Success(
+            new HistoryEdit("t0.s0", "It is TLS."),
+            new HistoryEdit("t1.s0", "It is TLS.")));
+        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, planner);
         using HttpClient client = factory.CreateClient();
         const string requestJson = """
             {
@@ -68,10 +72,11 @@ public sealed class ProviderProxyIntegrationTests
               "max_tokens": 100,
               "messages": [
                 { "role": "assistant", "content": [
-                  { "type": "thinking", "thinking": "DNS", "signature": "opaque" },
+                  { "type": "thinking", "thinking": "DNS", "signature": "opaque-signature" },
+                  { "type": "redacted_thinking", "data": "opaque-data" },
                   { "type": "text", "text": "It is DNS." }
                 ] },
-                { "role": "user", "content": "No, it is not DNS. It is TLS." }
+                { "role": "user", "content": "!!NO!! It is TLS." }
               ]
             }
             """;
@@ -79,26 +84,106 @@ public sealed class ProviderProxyIntegrationTests
         {
             Content = new StringContent(requestJson, Encoding.UTF8, "application/json"),
         };
-        request.Headers.TryAddWithoutValidation("x-api-key", "anthropic-secret");
+        request.Headers.TryAddWithoutValidation("x-api-key", "provider-anthropic-secret");
         request.Headers.TryAddWithoutValidation("anthropic-version", "2023-06-01");
 
         using HttpResponseMessage response = await client.SendAsync(request, CancellationToken.None);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(new Uri("https://api.anthropic.com/v1/messages"), upstream.RequestUri);
-        Assert.Equal("anthropic-secret", upstream.GetHeader("x-api-key"));
+        Assert.Equal("provider-anthropic-secret", upstream.GetHeader("x-api-key"));
         Assert.Equal("2023-06-01", upstream.GetHeader("anthropic-version"));
-        Assert.Equal("1", GetSingleHeader(response, ProviderProxy.OpaqueBlockCountHeader));
-        Assert.DoesNotContain("opaque", Encoding.UTF8.GetString(Assert.IsType<byte[]>(upstream.Body)));
+        string forwarded = Encoding.UTF8.GetString(Assert.IsType<byte[]>(upstream.Body));
+        Assert.DoesNotContain("opaque-signature", forwarded, StringComparison.Ordinal);
+        Assert.DoesNotContain("opaque-data", forwarded, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task NoOpRequestIsForwardedByteForByte()
+    public async Task CachePublicationFailureReturns503WithoutCallingPrimaryUpstream()
+    {
+        string directory = Path.Combine(
+            Path.GetTempPath(),
+            "PinkUnicornProxy.Tests",
+            $"integration-publication-failure-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        string databasePath = Path.Combine(directory, "cache.db");
+        try
+        {
+            RecordingHandler upstream = new();
+            FakePlanner planner = new(_ =>
+            {
+                File.Delete(databasePath);
+                return Success(new HistoryEdit("t0.s0", "It is TLS."));
+            });
+            Dictionary<string, string?> configuration = new()
+            {
+                ["PinkUnicorn:HistoryRewrite:Cache:DatabasePath"] = databasePath,
+            };
+            await using WebApplicationFactory<Program> factory = CreateFactory(
+                upstream,
+                planner,
+                configuration);
+            using HttpClient client = factory.CreateClient();
+
+            using HttpResponseMessage response = await client.PostAsync(
+                "/openai/v1/chat/completions",
+                new StringContent(
+                    "{\"messages\":[{\"role\":\"user\",\"content\":\"!!NO!! It is TLS.\"}]}",
+                    Encoding.UTF8,
+                    "application/json"),
+                CancellationToken.None);
+
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+            Assert.Contains(
+                "history-rewrite-cache-unavailable",
+                await response.Content.ReadAsStringAsync(CancellationToken.None),
+                StringComparison.Ordinal);
+            Assert.Equal(0, upstream.CallCount);
+            Assert.Equal(1, planner.CallCount);
+            using HttpResponseMessage readiness = await client.GetAsync(
+                "/health/ready",
+                CancellationToken.None);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, readiness.StatusCode);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task NoTriggerPreservesBodyAndHeadersAndNeverCallsPlanner()
     {
         RecordingHandler upstream = new();
-        await using WebApplicationFactory<Program> factory = CreateFactory(upstream);
+        FakePlanner planner = new(_ => throw new InvalidOperationException("Planner should not run."));
+        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, planner);
         using HttpClient client = factory.CreateClient();
         const string requestJson = "{ \"model\":\"gpt-test\", \"unknown\": 7, \"messages\": [ {\"role\":\"user\",\"content\":\"Hello\"} ] }";
+        using HttpRequestMessage request = new(HttpMethod.Post, "/openai/v1/chat/completions")
+        {
+            Content = new StringContent(requestJson, Encoding.UTF8, "application/json"),
+        };
+        request.Headers.TryAddWithoutValidation("X-Custom-End-To-End", "preserved");
+
+        using HttpResponseMessage response = await client.SendAsync(request, CancellationToken.None);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(Encoding.UTF8.GetBytes(requestJson), upstream.Body);
+        Assert.Equal("preserved", upstream.GetHeader("X-Custom-End-To-End"));
+        Assert.Null(upstream.GetHeader("X-Forwarded-For"));
+        Assert.Null(upstream.GetHeader("X-Forwarded-Host"));
+        Assert.Null(upstream.GetHeader("X-Forwarded-Proto"));
+        Assert.Equal(0, planner.CallCount);
+    }
+
+    [Fact]
+    public async Task NaturalLanguageCorrectionWithoutTokenPassesThroughUnchanged()
+    {
+        RecordingHandler upstream = new();
+        FakePlanner planner = new(_ => throw new InvalidOperationException("Planner should not run."));
+        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, planner);
+        using HttpClient client = factory.CreateClient();
+        const string requestJson = "{\"messages\":[{\"role\":\"user\",\"content\":\"No, it is not DNS. It is TLS.\"}]}";
 
         using HttpResponseMessage response = await client.PostAsync(
             "/openai/v1/chat/completions",
@@ -106,35 +191,59 @@ public sealed class ProviderProxyIntegrationTests
             CancellationToken.None);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        Assert.Equal("unchanged", GetSingleHeader(response, ProviderProxy.ResultHeader));
         Assert.Equal(Encoding.UTF8.GetBytes(requestJson), upstream.Body);
+        Assert.Equal(0, planner.CallCount);
     }
 
     [Fact]
-    public async Task NonGenerationOpenAIEndpointIsDeniedByDefault()
+    public async Task DuplicateJsonIsTransparentUntilACompetingHistoryContainsATrigger()
     {
         RecordingHandler upstream = new();
-        await using WebApplicationFactory<Program> factory = CreateFactory(upstream);
+        FakePlanner planner = new(_ => throw new InvalidOperationException("Planner should not run."));
+        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, planner);
+        using HttpClient client = factory.CreateClient();
+        const string unmarked = "{\"metadata\":{\"x\":1,\"x\":2},\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}";
+        const string marked = "{\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"messages\":[{\"role\":\"user\",\"content\":\"!!NO!! It is TLS.\"}]}";
+
+        using HttpResponseMessage unmarkedResponse = await client.PostAsync(
+            "/openai/v1/chat/completions",
+            new StringContent(unmarked, Encoding.UTF8, "application/json"),
+            CancellationToken.None);
+        using HttpResponseMessage markedResponse = await client.PostAsync(
+            "/openai/v1/chat/completions",
+            new StringContent(marked, Encoding.UTF8, "application/json"),
+            CancellationToken.None);
+
+        Assert.Equal(HttpStatusCode.OK, unmarkedResponse.StatusCode);
+        Assert.Equal(Encoding.UTF8.GetBytes(unmarked), upstream.Bodies[0]);
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, markedResponse.StatusCode);
+        Assert.Equal(1, upstream.CallCount);
+        Assert.Equal(0, planner.CallCount);
+    }
+
+    [Fact]
+    public async Task NonGenerationProviderPathPassesThroughWithQuery()
+    {
+        RecordingHandler upstream = new();
+        FakePlanner planner = new(_ => throw new InvalidOperationException("Planner should not run."));
+        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, planner);
         using HttpClient client = factory.CreateClient();
 
         using HttpResponseMessage response = await client.GetAsync(
-            "/openai/v1/models?limit=2",
+            "/openai/v1/models?limit=2&after=model_1",
             CancellationToken.None);
 
-        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
-        Assert.Equal("path-not-allowed", GetSingleHeader(response, ProviderProxy.ResultHeader));
-        Assert.Equal(0, upstream.CallCount);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(new Uri("https://api.openai.com/v1/models?limit=2&after=model_1"), upstream.RequestUri);
+        Assert.Equal(0, planner.CallCount);
     }
 
     [Fact]
-    public async Task DoubleSlashPathCannotReplaceConfiguredUpstreamAuthority()
+    public async Task DuplicatePathSlashIsPreservedWithoutChangingConfiguredAuthority()
     {
         RecordingHandler upstream = new();
-        Dictionary<string, string?> configuration = new()
-        {
-            ["PinkUnicorn:AllowOtherPaths"] = "true",
-        };
-        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, configuration);
+        FakePlanner planner = new(_ => throw new InvalidOperationException("Planner should not run."));
+        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, planner);
         using HttpClient client = factory.CreateClient();
 
         using HttpResponseMessage response = await client.GetAsync(
@@ -143,129 +252,160 @@ public sealed class ProviderProxyIntegrationTests
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal("api.openai.com", upstream.RequestUri?.Host);
-        Assert.Equal("/evil.example/v1/models", upstream.RequestUri?.AbsolutePath);
+        Assert.Equal("//evil.example/v1/models", upstream.RequestUri?.AbsolutePath);
     }
 
     [Fact]
-    public async Task OptionalProxyAccessTokenIsRequiredAndNeverForwarded()
+    public async Task EncodedNonJsonAndOversizedBodiesPassThroughUnchanged()
     {
         RecordingHandler upstream = new();
+        FakePlanner planner = new(_ => throw new InvalidOperationException("Planner should not run."));
         Dictionary<string, string?> configuration = new()
         {
-            ["PinkUnicorn:AccessToken"] = "a-synthetic-token-for-tests",
+            ["PinkUnicorn:MaximumRequestBodyBytes"] = "1024",
         };
-        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, configuration);
+        await using WebApplicationFactory<Program> factory = CreateFactory(
+            upstream,
+            planner,
+            configuration);
         using HttpClient client = factory.CreateClient();
-        const string requestJson = "{\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}";
 
-        using HttpResponseMessage denied = await client.PostAsync(
-            "/openai/v1/chat/completions",
-            new StringContent(requestJson, Encoding.UTF8, "application/json"),
-            CancellationToken.None);
-
-        Assert.Equal(HttpStatusCode.Unauthorized, denied.StatusCode);
-        Assert.Equal(0, upstream.CallCount);
-
-        using HttpRequestMessage allowedRequest = new(HttpMethod.Post, "/openai/v1/chat/completions")
-        {
-            Content = new StringContent(requestJson, Encoding.UTF8, "application/json"),
-        };
-        allowedRequest.Headers.TryAddWithoutValidation(
-            "X-Pink-Unicorn-Key",
-            "a-synthetic-token-for-tests");
-        using HttpResponseMessage allowed = await client.SendAsync(allowedRequest, CancellationToken.None);
-
-        Assert.Equal(HttpStatusCode.OK, allowed.StatusCode);
-        Assert.Equal(1, upstream.CallCount);
-        Assert.Null(upstream.GetHeader("X-Pink-Unicorn-Key"));
-    }
-
-    [Fact]
-    public async Task EncodedGenerationBodyFailsClosedInRewriteMode()
-    {
-        RecordingHandler upstream = new();
-        await using WebApplicationFactory<Program> factory = CreateFactory(upstream);
-        using HttpClient client = factory.CreateClient();
-        using HttpRequestMessage request = new(HttpMethod.Post, "/openai/v1/chat/completions")
+        using HttpRequestMessage encoded = new(HttpMethod.Post, "/openai/v1/chat/completions")
         {
             Content = new ByteArrayContent([1, 2, 3]),
         };
-        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-        request.Content.Headers.ContentEncoding.Add("gzip");
+        encoded.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+        encoded.Content.Headers.ContentEncoding.Add("gzip");
+        using HttpResponseMessage encodedResponse = await client.SendAsync(encoded, CancellationToken.None);
+        Assert.Equal(HttpStatusCode.OK, encodedResponse.StatusCode);
+        Assert.Equal(new byte[] { 1, 2, 3 }, upstream.Bodies[0]);
 
-        using HttpResponseMessage response = await client.SendAsync(request, CancellationToken.None);
-
-        Assert.Equal(HttpStatusCode.UnsupportedMediaType, response.StatusCode);
-        Assert.Equal("unsupported-content-encoding", GetSingleHeader(response, ProviderProxy.ResultHeader));
-        Assert.Equal(0, upstream.CallCount);
-    }
-
-    [Fact]
-    public async Task NonJsonGenerationBodyFailsClosedInRewriteMode()
-    {
-        RecordingHandler upstream = new();
-        await using WebApplicationFactory<Program> factory = CreateFactory(upstream);
-        using HttpClient client = factory.CreateClient();
-
-        using HttpResponseMessage response = await client.PostAsync(
+        using HttpResponseMessage textResponse = await client.PostAsync(
             "/openai/v1/chat/completions",
             new StringContent("not-json", Encoding.UTF8, "text/plain"),
             CancellationToken.None);
+        Assert.Equal(HttpStatusCode.OK, textResponse.StatusCode);
+        Assert.Equal(Encoding.UTF8.GetBytes("not-json"), upstream.Bodies[1]);
 
-        Assert.Equal(HttpStatusCode.UnsupportedMediaType, response.StatusCode);
-        Assert.Equal("unsupported-content-type", GetSingleHeader(response, ProviderProxy.ResultHeader));
+        string oversized = new string('x', 2_000);
+        using HttpResponseMessage oversizedResponse = await client.PostAsync(
+            "/openai/v1/chat/completions",
+            new StringContent(oversized, Encoding.UTF8, "application/json"),
+            CancellationToken.None);
+        Assert.Equal(HttpStatusCode.OK, oversizedResponse.StatusCode);
+        Assert.Equal(Encoding.UTF8.GetBytes(oversized), upstream.Bodies[2]);
+        Assert.Equal(0, planner.CallCount);
+    }
+
+    [Fact]
+    public async Task UnknownLengthBodyBeyondInspectionLimitReplaysBufferedPrefixExactly()
+    {
+        RecordingHandler upstream = new();
+        FakePlanner planner = new(_ => throw new InvalidOperationException("Planner should not run."));
+        Dictionary<string, string?> configuration = new()
+        {
+            ["PinkUnicorn:MaximumRequestBodyBytes"] = "1024",
+        };
+        await using WebApplicationFactory<Program> factory = CreateFactory(
+            upstream,
+            planner,
+            configuration);
+        using HttpClient client = factory.CreateClient();
+        byte[] body = Encoding.UTF8.GetBytes(new string('z', 2_000));
+        using HttpRequestMessage request = new(HttpMethod.Post, "/openai/v1/chat/completions")
+        {
+            Content = new UnknownLengthContent(body),
+        };
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+
+        using HttpResponseMessage response = await client.SendAsync(request, CancellationToken.None);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(body, upstream.Body);
+        Assert.Equal(0, planner.CallCount);
+    }
+
+    [Fact]
+    public async Task RewriterFailureFailsClosedWithoutCallingPrimaryUpstream()
+    {
+        RecordingHandler upstream = new();
+        FakePlanner planner = new(_ => HistoryEditPlannerResult.Failed(
+            HistoryEditPlannerFailure.Unavailable));
+        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, planner);
+        using HttpClient client = factory.CreateClient();
+        const string json = "{\"messages\":[{\"role\":\"user\",\"content\":\"!!NO!! It is TLS.\"}]}";
+
+        using HttpResponseMessage response = await client.PostAsync(
+            "/openai/v1/chat/completions",
+            new StringContent(json, Encoding.UTF8, "application/json"),
+            CancellationToken.None);
+        string problem = await response.Content.ReadAsStringAsync(CancellationToken.None);
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Contains("history-rewriter-unavailable", problem, StringComparison.Ordinal);
         Assert.Equal(0, upstream.CallCount);
     }
 
     [Fact]
-    public async Task BodyIntegrityHeaderFailsClosedWhenRewriteWouldChangeBytes()
+    public async Task InternalRewriterRequestCannotReenterProviderRoutes()
     {
         RecordingHandler upstream = new();
-        await using WebApplicationFactory<Program> factory = CreateFactory(upstream);
+        FakePlanner planner = new(_ => throw new InvalidOperationException("Planner should not run."));
+        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, planner);
         using HttpClient client = factory.CreateClient();
-        const string requestJson = """
-            { "messages": [
-              { "role": "assistant", "content": "It is DNS." },
-              { "role": "user", "content": "No, it is not DNS. It is TLS." }
-            ] }
-            """;
         using HttpRequestMessage request = new(HttpMethod.Post, "/openai/v1/chat/completions")
         {
-            Content = new StringContent(requestJson, Encoding.UTF8, "application/json"),
+            Content = new StringContent("{\"messages\":[]}", Encoding.UTF8, "application/json"),
+        };
+        request.Headers.TryAddWithoutValidation(
+            HistoryRewriteOptions.InternalRequestHeaderName,
+            "1");
+
+        using HttpResponseMessage response = await client.SendAsync(request, CancellationToken.None);
+
+        Assert.Equal((HttpStatusCode)508, response.StatusCode);
+        Assert.Equal(0, upstream.CallCount);
+        Assert.Equal(0, planner.CallCount);
+    }
+
+    [Fact]
+    public async Task BodyIntegrityHeaderFailsClosedOnlyWhenRewriteWouldOccur()
+    {
+        RecordingHandler upstream = new();
+        FakePlanner planner = new(_ => Success(new HistoryEdit("t0.s0", "It is TLS.")));
+        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, planner);
+        using HttpClient client = factory.CreateClient();
+        const string json = "{\"messages\":[{\"role\":\"user\",\"content\":\"!!NO!! It is TLS.\"}]}";
+        using HttpRequestMessage request = new(HttpMethod.Post, "/openai/v1/chat/completions")
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json"),
         };
         request.Headers.TryAddWithoutValidation("Content-Digest", "sha-256=:synthetic:");
 
         using HttpResponseMessage response = await client.SendAsync(request, CancellationToken.None);
 
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-        Assert.Equal("signed-body-conflict", GetSingleHeader(response, ProviderProxy.ResultHeader));
         Assert.Equal(0, upstream.CallCount);
+        Assert.Equal(0, planner.CallCount);
     }
 
     [Fact]
-    public async Task StatefulResponsesCorrectionFailsClosedByDefault()
+    public async Task StatefulResponsesTriggerFailsClosedBeforePlannerAndUpstream()
     {
         RecordingHandler upstream = new();
-        await using WebApplicationFactory<Program> factory = CreateFactory(upstream);
+        FakePlanner planner = new(_ => throw new InvalidOperationException("Planner should not run."));
+        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, planner);
         using HttpClient client = factory.CreateClient();
-        const string requestJson = """
-            {
-              "model": "gpt-test",
-              "previous_response_id": "resp_123",
-              "input": "No, it is not DNS. It is TLS."
-            }
-            """;
+        const string json = "{\"previous_response_id\":\"resp_123\",\"input\":\"!!NO!! It is TLS.\"}";
 
         using HttpResponseMessage response = await client.PostAsync(
             "/openai/v1/responses",
-            new StringContent(requestJson, Encoding.UTF8, "application/json"),
+            new StringContent(json, Encoding.UTF8, "application/json"),
             CancellationToken.None);
-        string problem = await response.Content.ReadAsStringAsync(CancellationToken.None);
 
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-        Assert.Equal("unsupported-stateful-context", GetSingleHeader(response, ProviderProxy.ResultHeader));
-        Assert.Contains("stateful-context-cannot-be-rewritten", problem, StringComparison.Ordinal);
         Assert.Equal(0, upstream.CallCount);
+        Assert.Equal(0, planner.CallCount);
     }
 
     [Fact]
@@ -281,17 +421,14 @@ public sealed class ProviderProxyIntegrationTests
             response.Content.Headers.ContentType = new MediaTypeHeaderValue("text/event-stream");
             return response;
         });
-        await using WebApplicationFactory<Program> factory = CreateFactory(upstream);
+        FakePlanner planner = new(_ => throw new InvalidOperationException("Planner should not run."));
+        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, planner);
         using HttpClient client = factory.CreateClient();
-        const string requestJson = "{\"model\":\"gpt-test\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}";
-        using HttpRequestMessage request = new(HttpMethod.Post, "/openai/v1/chat/completions")
-        {
-            Content = new StringContent(requestJson, Encoding.UTF8, "application/json"),
-        };
+        const string json = "{\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}";
 
-        using HttpResponseMessage response = await client.SendAsync(
-            request,
-            HttpCompletionOption.ResponseHeadersRead,
+        using HttpResponseMessage response = await client.PostAsync(
+            "/openai/v1/chat/completions",
+            new StringContent(json, Encoding.UTF8, "application/json"),
             CancellationToken.None);
         string received = await response.Content.ReadAsStringAsync(CancellationToken.None);
 
@@ -300,64 +437,99 @@ public sealed class ProviderProxyIntegrationTests
     }
 
     [Fact]
-    public async Task OversizedInspectableBodyIsRejectedBeforeUpstream()
+    public async Task OptionalProxyAccessTokenIsConsumedOnlyWhenConfigured()
     {
         RecordingHandler upstream = new();
+        FakePlanner planner = new(_ => throw new InvalidOperationException("Planner should not run."));
         Dictionary<string, string?> configuration = new()
         {
-            ["PinkUnicorn:MaximumRequestBodyBytes"] = "1024",
+            ["PinkUnicorn:AccessToken"] = "a-synthetic-token-for-tests",
         };
-        await using WebApplicationFactory<Program> factory = CreateFactory(upstream, configuration);
+        await using WebApplicationFactory<Program> factory = CreateFactory(
+            upstream,
+            planner,
+            configuration);
         using HttpClient client = factory.CreateClient();
-        JsonObject request = new()
-        {
-            ["model"] = "gpt-test",
-            ["messages"] = new JsonArray
-            {
-                new JsonObject
-                {
-                    ["role"] = "user",
-                    ["content"] = new string('x', 2_000),
-                },
-            },
-        };
+        const string json = "{\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}";
 
-        using HttpResponseMessage response = await client.PostAsync(
+        using HttpResponseMessage denied = await client.PostAsync(
             "/openai/v1/chat/completions",
-            new StringContent(request.ToJsonString(), Encoding.UTF8, "application/json"),
+            new StringContent(json, Encoding.UTF8, "application/json"),
             CancellationToken.None);
+        Assert.Equal(HttpStatusCode.Unauthorized, denied.StatusCode);
 
-        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
-        Assert.Equal("request-body-too-large", GetSingleHeader(response, ProviderProxy.ResultHeader));
-        Assert.Equal(0, upstream.CallCount);
+        using HttpRequestMessage allowedRequest = new(HttpMethod.Post, "/openai/v1/chat/completions")
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json"),
+        };
+        allowedRequest.Headers.TryAddWithoutValidation(
+            "X-Pink-Unicorn-Key",
+            "a-synthetic-token-for-tests");
+        using HttpResponseMessage allowed = await client.SendAsync(allowedRequest, CancellationToken.None);
+
+        Assert.Equal(HttpStatusCode.OK, allowed.StatusCode);
+        Assert.Null(upstream.GetHeader("X-Pink-Unicorn-Key"));
     }
 
     private static WebApplicationFactory<Program> CreateFactory(
         RecordingHandler upstream,
+        FakePlanner planner,
         IReadOnlyDictionary<string, string?>? configuration = null)
     {
         return new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
-            if (configuration is not null)
+            Dictionary<string, string?> testConfiguration = configuration is null
+                ? new(StringComparer.OrdinalIgnoreCase)
+                : new(configuration, StringComparer.OrdinalIgnoreCase);
+            const string cachePathKey = "PinkUnicorn:HistoryRewrite:Cache:DatabasePath";
+            if (!testConfiguration.ContainsKey(cachePathKey))
             {
-                builder.ConfigureAppConfiguration((_, config) =>
-                    config.AddInMemoryCollection(configuration));
+                testConfiguration[cachePathKey] = Path.Combine(
+                    Path.GetTempPath(),
+                    "PinkUnicornProxy.Tests",
+                    $"integration-{Guid.NewGuid():N}.db");
             }
+            builder.ConfigureAppConfiguration((_, config) =>
+                config.AddInMemoryCollection(testConfiguration));
 
             builder.ConfigureServices(services =>
             {
                 services.RemoveAll<HttpMessageInvoker>();
                 services.AddSingleton(new HttpMessageInvoker(upstream, disposeHandler: false));
+                services.RemoveAll<IHistoryEditPlanner>();
+                services.AddSingleton<IHistoryEditPlanner>(planner);
             });
         });
     }
 
-    private static string GetSingleHeader(HttpResponseMessage response, string name) =>
-        Assert.Single(response.Headers.GetValues(name));
+    private static HistoryEditPlannerResult Success(params HistoryEdit[] edits) =>
+        HistoryEditPlannerResult.Success(new HistoryEditPlan(edits));
+
+    private sealed class FakePlanner : IHistoryEditPlanner
+    {
+        private readonly Func<HistoryEditRequest, HistoryEditPlannerResult> callback;
+
+        public FakePlanner(Func<HistoryEditRequest, HistoryEditPlannerResult> callback)
+        {
+            this.callback = callback;
+        }
+
+        public int CallCount { get; private set; }
+
+        public Task<HistoryEditPlannerResult> CreatePlanAsync(
+            HistoryEditRequest request,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            CallCount++;
+            return Task.FromResult(callback(request));
+        }
+    }
 
     private sealed class RecordingHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, HttpResponseMessage> responseFactory;
+        private readonly Dictionary<string, string[]> headers = new(StringComparer.OrdinalIgnoreCase);
 
         public RecordingHandler(Func<HttpRequestMessage, HttpResponseMessage>? responseFactory = null)
         {
@@ -373,12 +545,12 @@ public sealed class ProviderProxyIntegrationTests
 
         public byte[]? Body { get; private set; }
 
+        public List<byte[]> Bodies { get; } = [];
+
         public string? Authorization { get; private set; }
 
-        private Dictionary<string, string[]> Headers { get; } = new(StringComparer.OrdinalIgnoreCase);
-
         public string? GetHeader(string name) =>
-            Headers.TryGetValue(name, out string[]? values) ? Assert.Single(values) : null;
+            headers.TryGetValue(name, out string[]? values) ? Assert.Single(values) : null;
 
         protected override async Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request,
@@ -387,22 +559,45 @@ public sealed class ProviderProxyIntegrationTests
             CallCount++;
             RequestUri = request.RequestUri;
             Authorization = request.Headers.Authorization?.ToString();
+            headers.Clear();
             foreach ((string name, IEnumerable<string> values) in request.Headers)
             {
-                Headers[name] = values.ToArray();
+                headers[name] = values.ToArray();
             }
 
             if (request.Content is not null)
             {
                 foreach ((string name, IEnumerable<string> values) in request.Content.Headers)
                 {
-                    Headers[name] = values.ToArray();
+                    headers[name] = values.ToArray();
                 }
 
                 Body = await request.Content.ReadAsByteArrayAsync(cancellationToken);
+                Bodies.Add(Body);
             }
 
             return responseFactory(request);
+        }
+    }
+
+    private sealed class UnknownLengthContent : HttpContent
+    {
+        private readonly byte[] body;
+
+        public UnknownLengthContent(byte[] body)
+        {
+            this.body = body;
+        }
+
+        protected override Task SerializeToStreamAsync(
+            Stream stream,
+            TransportContext? context) =>
+            stream.WriteAsync(body).AsTask();
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
         }
     }
 }

@@ -4,20 +4,12 @@ namespace PinkUnicornProxy.Proxy;
 
 internal sealed class ProviderRequestTransformer : HttpTransformer
 {
-    private static readonly string[] RemovedHeaders =
-    [
-        "Cookie",
-        "Forwarded",
-        "Proxy-Authorization",
-        "X-Forwarded-For",
-        "X-Forwarded-Host",
-        "X-Forwarded-Prefix",
-        "X-Forwarded-Proto",
-        "X-Pink-Unicorn-Key",
-        "X-Real-IP",
-    ];
+    private readonly bool removeAccessTokenHeader;
 
-    public static ProviderRequestTransformer Instance { get; } = new();
+    public ProviderRequestTransformer(bool removeAccessTokenHeader)
+    {
+        this.removeAccessTokenHeader = removeAccessTokenHeader;
+    }
 
     public override async ValueTask TransformRequestAsync(
         HttpContext httpContext,
@@ -31,17 +23,13 @@ internal sealed class ProviderRequestTransformer : HttpTransformer
             destinationPrefix,
             cancellationToken);
 
-        foreach (string header in RemovedHeaders)
-        {
-            proxyRequest.Headers.Remove(header);
-        }
+        // The incoming Host names the proxy. Clearing it lets HttpClient emit the fixed
+        // destination authority; every other copied end-to-end header is left alone.
+        proxyRequest.Headers.Host = null;
 
-        foreach ((string name, _) in proxyRequest.Headers.ToArray())
+        if (removeAccessTokenHeader)
         {
-            if (name.StartsWith("X-Pink-Unicorn-", StringComparison.OrdinalIgnoreCase))
-            {
-                proxyRequest.Headers.Remove(name);
-            }
+            proxyRequest.Headers.Remove("X-Pink-Unicorn-Key");
         }
     }
 }

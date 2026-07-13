@@ -14,47 +14,72 @@ internal enum RewriteOutcome
     AuditMatch,
     InvalidJson,
     UnsupportedShape,
+    AmbiguousJsonProperties,
     UnsupportedStatefulContext,
     DeferredOpenToolTurn,
     ProtectedContentConflict,
-    UnsupportedContentType,
-    UnsupportedContentEncoding,
     SignedBodyConflict,
-    CorrectionLimitExceeded,
+    RewriterNotConfigured,
+    RewriterUnavailable,
+    CacheUnavailable,
+    PlannerInputTooLarge,
+    InvalidRewriterResponse,
+    UnsafeRewriterOutput,
+    EditLimitExceeded,
 }
 
 internal sealed record RewriteResult(
     byte[] Body,
     RewriteOutcome Outcome,
-    int CorrectionCount = 0,
+    int TriggerCount = 0,
     int TextEditCount = 0,
-    int OpaqueBlockCount = 0)
+    int OpaqueBlockCount = 0,
+    bool CacheHit = false)
 {
     public bool BodyChanged => Outcome == RewriteOutcome.Rewritten;
-
-    public string HeaderValue => Outcome switch
-    {
-        RewriteOutcome.Unchanged => "unchanged",
-        RewriteOutcome.Rewritten => "rewritten",
-        RewriteOutcome.AuditMatch => "audit-match",
-        RewriteOutcome.InvalidJson => "invalid-json",
-        RewriteOutcome.UnsupportedShape => "unsupported-shape",
-        RewriteOutcome.UnsupportedStatefulContext => "unsupported-stateful-context",
-        RewriteOutcome.DeferredOpenToolTurn => "deferred-open-tool-turn",
-        RewriteOutcome.ProtectedContentConflict => "protected-content-conflict",
-        RewriteOutcome.UnsupportedContentType => "unsupported-content-type",
-        RewriteOutcome.UnsupportedContentEncoding => "unsupported-content-encoding",
-        RewriteOutcome.SignedBodyConflict => "signed-body-conflict",
-        RewriteOutcome.CorrectionLimitExceeded => "correction-limit-exceeded",
-        _ => "unknown",
-    };
 
     public static RewriteResult Unchanged(byte[] body, RewriteOutcome outcome = RewriteOutcome.Unchanged) =>
         new(body, outcome);
 }
 
-internal sealed record CorrectionIntent(
-    string? RejectedClaim,
-    string AffirmativeText,
-    bool IsDeictic,
-    string Rule);
+internal sealed record HistoryTextTarget(
+    string Id,
+    int TurnIndex,
+    string Role,
+    bool ContainsTrigger);
+
+internal sealed record HistoryEdit(string Id, string? Replacement);
+
+internal sealed record HistoryEditPlan(IReadOnlyList<HistoryEdit> Edits);
+
+internal sealed record HistoryEditRequest(
+    ProviderRequestKind Provider,
+    string HistoryJson,
+    IReadOnlyList<HistoryTextTarget> Targets,
+    IReadOnlyList<string> TriggerTokens,
+    HistoryEditPlanningMode Mode = HistoryEditPlanningMode.FullHistory,
+    string? RewrittenPrefixJson = null,
+    string? EditableSuffixJson = null);
+
+internal enum HistoryEditPlanningMode
+{
+    FullHistory,
+    Continuation,
+}
+
+internal enum HistoryEditPlannerFailure
+{
+    NotConfigured,
+    Unavailable,
+    InputTooLarge,
+    InvalidResponse,
+}
+
+internal sealed record HistoryEditPlannerResult(
+    HistoryEditPlan? Plan,
+    HistoryEditPlannerFailure? Failure = null)
+{
+    public static HistoryEditPlannerResult Success(HistoryEditPlan plan) => new(plan);
+
+    public static HistoryEditPlannerResult Failed(HistoryEditPlannerFailure failure) => new(null, failure);
+}

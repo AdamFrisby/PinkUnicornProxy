@@ -18,6 +18,10 @@ appsettings.Local.json
 .env.*
 !.env.example
 
+## Durable local rewrite cache
+/data/
+/src/PinkUnicornProxy/data/
+
 ## Operating systems
 .DS_Store
 Thumbs.db

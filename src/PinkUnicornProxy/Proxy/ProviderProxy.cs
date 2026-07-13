@@ -13,18 +13,6 @@ namespace PinkUnicornProxy.Proxy;
 
 internal sealed partial class ProviderProxy
 {
-    internal const string ResultHeader = "X-Pink-Unicorn-Result";
-    internal const string CorrectionCountHeader = "X-Pink-Unicorn-Corrections";
-    internal const string OpaqueBlockCountHeader = "X-Pink-Unicorn-Opaque-Blocks-Removed";
-
-    private readonly IHttpForwarder forwarder;
-    private readonly HttpMessageInvoker httpClient;
-    private readonly ConversationRewriter rewriter;
-    private readonly PinkUnicornOptions options;
-    private readonly ForwarderRequestConfig requestConfig;
-    private readonly ILogger<ProviderProxy> logger;
-    private readonly byte[]? accessTokenHash;
-
     private static readonly string[] BodyIntegrityHeaders =
     [
         "Content-Digest",
@@ -34,6 +22,14 @@ internal sealed partial class ProviderProxy
         "Signature",
         "Signature-Input",
     ];
+
+    private readonly IHttpForwarder forwarder;
+    private readonly HttpMessageInvoker httpClient;
+    private readonly ConversationRewriter rewriter;
+    private readonly PinkUnicornOptions options;
+    private readonly ILogger<ProviderProxy> logger;
+    private readonly byte[]? accessTokenHash;
+    private readonly ProviderRequestTransformer transformer;
 
     public ProviderProxy(
         IHttpForwarder forwarder,
@@ -50,15 +46,10 @@ internal sealed partial class ProviderProxy
         accessTokenHash = string.IsNullOrEmpty(this.options.AccessToken)
             ? null
             : SHA256.HashData(Encoding.UTF8.GetBytes(this.options.AccessToken));
-        requestConfig = new ForwarderRequestConfig
-        {
-            ActivityTimeout = this.options.ActivityTimeout,
-            Version = HttpVersion.Version20,
-            VersionPolicy = HttpVersionPolicy.RequestVersionOrLower,
-        };
+        transformer = new ProviderRequestTransformer(accessTokenHash is not null);
     }
 
-    public async Task ForwardOpenAIAsync(HttpContext context)
+    public Task ForwardOpenAIAsync(HttpContext context)
     {
         string path = GetForwardPath(context, "/openai");
         ProviderRequestKind? requestKind = path switch
@@ -69,10 +60,10 @@ internal sealed partial class ProviderProxy
             _ => null,
         };
 
-        await ForwardAsync(context, options.Upstreams.OpenAI, path, requestKind);
+        return ForwardAsync(context, options.Upstreams.OpenAI, path, requestKind);
     }
 
-    public async Task ForwardAnthropicAsync(HttpContext context)
+    public Task ForwardAnthropicAsync(HttpContext context)
     {
         string path = GetForwardPath(context, "/anthropic");
         ProviderRequestKind? requestKind = path switch
@@ -82,7 +73,7 @@ internal sealed partial class ProviderProxy
             _ => null,
         };
 
-        await ForwardAsync(context, options.Upstreams.Anthropic, path, requestKind);
+        return ForwardAsync(context, options.Upstreams.Anthropic, path, requestKind);
     }
 
     private async Task ForwardAsync(
@@ -93,7 +84,6 @@ internal sealed partial class ProviderProxy
     {
         if (!IsAuthorized(context.Request))
         {
-            context.Response.Headers[ResultHeader] = "authentication-required";
             context.Response.Headers.WWWAuthenticate = "PinkUnicornKey";
             await WriteProblemAsync(
                 context,
@@ -103,165 +93,112 @@ internal sealed partial class ProviderProxy
             return;
         }
 
-        if (HttpMethods.IsConnect(context.Request.Method)
-            || HttpMethods.IsTrace(context.Request.Method)
-            || context.WebSockets.IsWebSocketRequest
-            || context.Request.Headers.Connection.Any(value =>
-                value?.Contains("upgrade", StringComparison.OrdinalIgnoreCase) == true))
+        if (context.Request.Headers.ContainsKey(HistoryRewriteOptions.InternalRequestHeaderName))
         {
-            context.Response.Headers[ResultHeader] = "method-not-allowed";
             await WriteProblemAsync(
                 context,
-                StatusCodes.Status405MethodNotAllowed,
-                "method-not-allowed",
-                "CONNECT, TRACE, and protocol upgrades are not supported by this HTTP generation proxy.");
+                StatusCodes.Status508LoopDetected,
+                "recursive-history-rewriter-request",
+                "A history rewriter request was routed back through Pink Unicorn Proxy.");
             return;
         }
 
-        if (requestKind is not null && !HttpMethods.IsPost(context.Request.Method))
-        {
-            context.Response.Headers.Allow = "POST";
-            context.Response.Headers[ResultHeader] = "method-not-allowed";
-            await WriteProblemAsync(
-                context,
-                StatusCodes.Status405MethodNotAllowed,
-                "method-not-allowed",
-                "Supported generation endpoints accept POST requests only.");
-            return;
-        }
-
-        if (requestKind is null && !options.AllowOtherPaths)
-        {
-            context.Response.Headers[ResultHeader] = "path-not-allowed";
-            await WriteProblemAsync(
-                context,
-                StatusCodes.Status404NotFound,
-                "path-not-allowed",
-                "The path is outside the default provider endpoint allowlist.");
-            return;
-        }
-
-        Stream? bufferedBody = null;
+        Stream? replayBody = null;
+        Stream? replacementBody = null;
         try
         {
-            if (requestKind is not null && options.Mode == ProxyMode.Off)
+            bool inspectable = requestKind is not null
+                && HttpMethods.IsPost(context.Request.Method)
+                && options.Mode != ProxyMode.Off
+                && HasJsonContentType(context.Request)
+                && !HasUnsupportedContentEncoding(context.Request);
+
+            if (inspectable)
             {
-                RegisterOutcomeHeaders(context, RewriteResult.Unchanged([]));
-                await ForwardBufferedOrStreamingAsync(context, destination, forwardPath);
-                return;
-            }
-
-            if (requestKind is not null
-                && !HasJsonContentType(context.Request))
-            {
-                RewriteResult contentTypeResult = RewriteResult.Unchanged(
-                    [],
-                    RewriteOutcome.UnsupportedContentType);
-                RegisterOutcomeHeaders(context, contentTypeResult);
-                if (options.Mode == ProxyMode.Rewrite)
-                {
-                    await WriteRewriteProblemAsync(context, contentTypeResult);
-                    return;
-                }
-
-                await ForwardBufferedOrStreamingAsync(context, destination, forwardPath);
-                return;
-            }
-
-            if (requestKind is not null && HasJsonContentType(context.Request))
-            {
-                if (HasUnsupportedContentEncoding(context.Request))
-                {
-                    RewriteResult encodingResult = RewriteResult.Unchanged(
-                        [],
-                        RewriteOutcome.UnsupportedContentEncoding);
-                    RegisterOutcomeHeaders(context, encodingResult);
-                    if (options.Mode == ProxyMode.Rewrite)
-                    {
-                        await WriteRewriteProblemAsync(context, encodingResult);
-                        return;
-                    }
-
-                    await ForwardBufferedOrStreamingAsync(
-                        context,
-                        destination,
-                        forwardPath);
-                    return;
-                }
-
-                byte[]? requestBody = await ReadBodyAsync(
+                RequestBodyReadResult readResult = await ReadInspectableBodyAsync(
                     context.Request,
                     options.MaximumRequestBodyBytes,
                     context.RequestAborted);
-
-                if (requestBody is null)
+                if (readResult.ReplayBody is not null)
                 {
-                    context.Response.Headers[ResultHeader] = "request-body-too-large";
-                    await WriteProblemAsync(
-                        context,
-                        StatusCodes.Status413PayloadTooLarge,
-                        "request-body-too-large",
-                        $"The request exceeds the configured {options.MaximumRequestBodyBytes} byte rewrite limit.");
-                    return;
+                    replayBody = readResult.ReplayBody;
+                    context.Request.Body = replayBody;
                 }
 
-                RewriteResult result = rewriter.Rewrite(requestKind.Value, requestBody);
-                if (result.BodyChanged && HasBodyIntegrityProtection(context.Request))
+                byte[]? originalBody = readResult.InspectableBody;
+                if (originalBody is not null)
                 {
-                    result = result with
+                    RewriteResult result = await rewriter.RewriteAsync(
+                        requestKind!.Value,
+                        originalBody,
+                        HasBodyIntegrityProtection(context.Request),
+                        context.RequestAborted);
+
+                    if (ShouldReject(result))
                     {
-                        Body = requestBody,
-                        Outcome = RewriteOutcome.SignedBodyConflict,
-                        TextEditCount = 0,
-                        OpaqueBlockCount = 0,
-                    };
+                        await WriteRewriteProblemAsync(context, result);
+                        return;
+                    }
+
+                    if (result.BodyChanged)
+                    {
+                        replacementBody = new MemoryStream(result.Body, writable: false);
+                        context.Request.Body = replacementBody;
+                        if (context.Request.ContentLength.HasValue)
+                        {
+                            context.Request.ContentLength = result.Body.Length;
+                        }
+
+                        if (result.CacheHit)
+                        {
+                            LogCacheReplay(logger, requestKind.Value, result.TriggerCount);
+                        }
+                        else
+                        {
+                            LogRewrite(
+                                logger,
+                                requestKind.Value,
+                                result.TriggerCount,
+                                result.TextEditCount,
+                                result.OpaqueBlockCount);
+                        }
+                    }
+                    else if (result.Outcome == RewriteOutcome.AuditMatch)
+                    {
+                        LogAuditMatch(logger, requestKind.Value, result.TriggerCount);
+                    }
                 }
-
-                RegisterOutcomeHeaders(context, result);
-
-                if (ShouldReject(result))
-                {
-                    await WriteRewriteProblemAsync(context, result);
-                    return;
-                }
-
-                byte[] outboundBody = result.BodyChanged ? result.Body : requestBody;
-                bufferedBody = new MemoryStream(outboundBody, writable: false);
-                context.Request.Body = bufferedBody;
-                context.Request.ContentLength = outboundBody.Length;
-                context.Request.Headers.Remove("Transfer-Encoding");
-            }
-            else
-            {
-                RegisterOutcomeHeaders(context, RewriteResult.Unchanged([]));
             }
 
-            await ForwardBufferedOrStreamingAsync(context, destination, forwardPath);
+            await ForwardAsync(context, destination, forwardPath);
         }
         finally
         {
-            if (bufferedBody is not null)
+            if (replacementBody is not null)
             {
-                await bufferedBody.DisposeAsync();
+                await replacementBody.DisposeAsync();
+            }
+
+            if (replayBody is not null)
+            {
+                await replayBody.DisposeAsync();
             }
         }
     }
 
-    private bool ShouldReject(RewriteResult result)
-    {
-        return result.Outcome switch
-        {
-            RewriteOutcome.UnsupportedStatefulContext =>
-                options.StatefulResponsesPolicy == StatefulResponsesPolicy.Reject,
-            RewriteOutcome.DeferredOpenToolTurn => true,
-            RewriteOutcome.ProtectedContentConflict => true,
-            RewriteOutcome.UnsupportedContentType => options.Mode == ProxyMode.Rewrite,
-            RewriteOutcome.UnsupportedContentEncoding => options.Mode == ProxyMode.Rewrite,
-            RewriteOutcome.SignedBodyConflict => true,
-            RewriteOutcome.CorrectionLimitExceeded => true,
-            _ => false,
-        };
-    }
+    private static bool ShouldReject(RewriteResult result) => result.Outcome is
+        RewriteOutcome.AmbiguousJsonProperties
+        or RewriteOutcome.UnsupportedStatefulContext
+        or RewriteOutcome.DeferredOpenToolTurn
+        or RewriteOutcome.ProtectedContentConflict
+        or RewriteOutcome.SignedBodyConflict
+        or RewriteOutcome.RewriterNotConfigured
+        or RewriteOutcome.RewriterUnavailable
+        or RewriteOutcome.CacheUnavailable
+        or RewriteOutcome.PlannerInputTooLarge
+        or RewriteOutcome.InvalidRewriterResponse
+        or RewriteOutcome.UnsafeRewriterOutput
+        or RewriteOutcome.EditLimitExceeded;
 
     private static bool HasJsonContentType(HttpRequest request)
     {
@@ -305,7 +242,7 @@ internal sealed partial class ProviderProxy
         return CryptographicOperations.FixedTimeEquals(accessTokenHash, suppliedHash);
     }
 
-    private async Task ForwardBufferedOrStreamingAsync(
+    private async Task ForwardAsync(
         HttpContext context,
         string destination,
         string forwardPath)
@@ -314,12 +251,18 @@ internal sealed partial class ProviderProxy
         context.Request.Path = new PathString(forwardPath);
         try
         {
+            ForwarderRequestConfig requestConfig = new()
+            {
+                ActivityTimeout = options.ActivityTimeout,
+                Version = GetIncomingVersion(context.Request.Protocol),
+                VersionPolicy = HttpVersionPolicy.RequestVersionOrLower,
+            };
             ForwarderError error = await forwarder.SendAsync(
                 context,
                 destination.TrimEnd('/'),
                 httpClient,
                 requestConfig,
-                ProviderRequestTransformer.Instance);
+                transformer);
 
             if (error != ForwarderError.None
                 && !(context.RequestAborted.IsCancellationRequested && IsCancellationError(error)))
@@ -334,6 +277,14 @@ internal sealed partial class ProviderProxy
         }
     }
 
+    private static Version GetIncomingVersion(string protocol) => protocol switch
+    {
+        "HTTP/3" => HttpVersion.Version30,
+        "HTTP/2" => HttpVersion.Version20,
+        "HTTP/1.0" => HttpVersion.Version10,
+        _ => HttpVersion.Version11,
+    };
+
     private static bool IsCancellationError(ForwarderError error) => error is
         ForwarderError.RequestCanceled
         or ForwarderError.RequestBodyCanceled
@@ -341,20 +292,19 @@ internal sealed partial class ProviderProxy
         or ForwarderError.UpgradeRequestCanceled
         or ForwarderError.UpgradeResponseCanceled;
 
-    private static async Task<byte[]?> ReadBodyAsync(
+    private static async Task<RequestBodyReadResult> ReadInspectableBodyAsync(
         HttpRequest request,
         long maximumBytes,
         CancellationToken cancellationToken)
     {
         if (request.ContentLength > maximumBytes)
         {
-            return null;
+            return RequestBodyReadResult.Uninspectable;
         }
 
         int initialCapacity = request.ContentLength is > 0 and <= int.MaxValue
             ? (int)request.ContentLength.Value
             : 16 * 1024;
-
         using MemoryStream buffer = new(initialCapacity);
         byte[] rented = ArrayPool<byte>.Shared.Rent(64 * 1024);
         try
@@ -364,18 +314,20 @@ internal sealed partial class ProviderProxy
                 int read = await request.Body.ReadAsync(rented, cancellationToken);
                 if (read == 0)
                 {
-                    break;
-                }
-
-                if (buffer.Length + read > maximumBytes)
-                {
-                    return null;
+                    byte[] body = buffer.ToArray();
+                    return new RequestBodyReadResult(
+                        body,
+                        new MemoryStream(body, writable: false));
                 }
 
                 await buffer.WriteAsync(rented.AsMemory(0, read), cancellationToken);
+                if (buffer.Length > maximumBytes)
+                {
+                    return new RequestBodyReadResult(
+                        null,
+                        new PrefixReadStream(buffer.ToArray(), request.Body));
+                }
             }
-
-            return buffer.ToArray();
         }
         finally
         {
@@ -383,71 +335,70 @@ internal sealed partial class ProviderProxy
         }
     }
 
-    private static void RegisterOutcomeHeaders(HttpContext context, RewriteResult result)
-    {
-        context.Response.OnStarting(
-            static state =>
-            {
-                (HttpContext httpContext, RewriteResult rewriteResult) =
-                    ((HttpContext, RewriteResult))state;
-                httpContext.Response.Headers[ResultHeader] = rewriteResult.HeaderValue;
-
-                if (rewriteResult.CorrectionCount > 0)
-                {
-                    httpContext.Response.Headers[CorrectionCountHeader] =
-                        rewriteResult.CorrectionCount.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                }
-
-                if (rewriteResult.OpaqueBlockCount > 0)
-                {
-                    httpContext.Response.Headers[OpaqueBlockCountHeader] =
-                        rewriteResult.OpaqueBlockCount.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                }
-
-                return Task.CompletedTask;
-            },
-            (context, result));
-    }
-
     private static Task WriteRewriteProblemAsync(HttpContext context, RewriteResult result)
     {
         return result.Outcome switch
         {
+            RewriteOutcome.AmbiguousJsonProperties => WriteProblemAsync(
+                context,
+                StatusCodes.Status422UnprocessableEntity,
+                "ambiguous-json-properties",
+                "The request contains duplicate JSON property names and cannot be rewritten unambiguously."),
             RewriteOutcome.UnsupportedStatefulContext => WriteProblemAsync(
                 context,
                 StatusCodes.Status409Conflict,
                 "stateful-context-cannot-be-rewritten",
-                "This Responses API request refers to provider-held history. Supply the full input history or configure FreshStart to discard provider-held context."),
+                "This Responses API request refers to provider-held history. Supply the complete input history in one request."),
             RewriteOutcome.DeferredOpenToolTurn => WriteProblemAsync(
                 context,
                 StatusCodes.Status409Conflict,
                 "open-tool-turn-is-immutable",
-                "The correction intersects an open tool/thinking transaction. Complete or abandon that transaction before rewriting its history."),
+                "The trigger intersects an open tool or thinking transaction. Complete or abandon that transaction before rewriting history."),
             RewriteOutcome.ProtectedContentConflict => WriteProblemAsync(
                 context,
                 StatusCodes.Status409Conflict,
                 "protected-content-cannot-be-rewritten",
-                "The rejected claim occurs in protected code, URL, media, or protocol content. The proxy will not edit that content or claim a forgetting guarantee."),
-            RewriteOutcome.UnsupportedContentType => WriteProblemAsync(
-                context,
-                StatusCodes.Status415UnsupportedMediaType,
-                "non-json-body-cannot-be-rewritten",
-                "Supported generation endpoints must use an application/json or +json Content-Type so the proxy can enforce rewriting."),
-            RewriteOutcome.UnsupportedContentEncoding => WriteProblemAsync(
-                context,
-                StatusCodes.Status415UnsupportedMediaType,
-                "encoded-body-cannot-be-rewritten",
-                "A supported generation request used a non-identity Content-Encoding. Send unencoded JSON so the proxy can enforce rewriting."),
+                "A trigger occurs in text with provider-managed citations, annotations, or log probabilities."),
             RewriteOutcome.SignedBodyConflict => WriteProblemAsync(
                 context,
                 StatusCodes.Status409Conflict,
                 "signed-body-cannot-be-rewritten",
                 "The request has body-integrity or HTTP-signature headers that would become invalid after rewriting."),
-            RewriteOutcome.CorrectionLimitExceeded => WriteProblemAsync(
+            RewriteOutcome.RewriterNotConfigured => WriteProblemAsync(
+                context,
+                StatusCodes.Status503ServiceUnavailable,
+                "history-rewriter-not-configured",
+                "Configure a HistoryRewrite endpoint and model before using a history rewrite trigger."),
+            RewriteOutcome.RewriterUnavailable => WriteProblemAsync(
+                context,
+                StatusCodes.Status502BadGateway,
+                "history-rewriter-unavailable",
+                "The auxiliary history rewriter did not return a usable response."),
+            RewriteOutcome.CacheUnavailable => WriteProblemAsync(
+                context,
+                StatusCodes.Status503ServiceUnavailable,
+                "history-rewrite-cache-unavailable",
+                "The durable history rewrite cache is unavailable; no competing revision was created."),
+            RewriteOutcome.PlannerInputTooLarge => WriteProblemAsync(
+                context,
+                StatusCodes.Status413PayloadTooLarge,
+                "history-planner-input-too-large",
+                "The complete history planning request exceeds the configured auxiliary request byte limit."),
+            RewriteOutcome.InvalidRewriterResponse => WriteProblemAsync(
+                context,
+                StatusCodes.Status502BadGateway,
+                "invalid-history-rewriter-response",
+                "The auxiliary history rewriter returned malformed output."),
+            RewriteOutcome.UnsafeRewriterOutput => WriteProblemAsync(
                 context,
                 StatusCodes.Status422UnprocessableEntity,
-                "correction-limit-exceeded",
-                "The transcript contains more correction events than the configured per-request limit."),
+                "unsafe-history-rewriter-output",
+                "The auxiliary history rewriter proposed an incomplete or structurally unsafe edit plan."),
+            RewriteOutcome.EditLimitExceeded => WriteProblemAsync(
+                context,
+                StatusCodes.Status422UnprocessableEntity,
+                "history-edit-limit-exceeded",
+                "The auxiliary history rewriter proposed more edits than the configured per-request limit."),
             _ => throw new InvalidOperationException($"No problem response is defined for {result.Outcome}."),
         };
     }
@@ -476,10 +427,116 @@ internal sealed partial class ProviderProxy
         string path = requestPath.StartsWith(routePrefix, StringComparison.OrdinalIgnoreCase)
             ? requestPath[routePrefix.Length..]
             : requestPath;
-        return string.IsNullOrEmpty(path) ? "/" : $"/{path.TrimStart('/')}";
+        if (string.IsNullOrEmpty(path))
+        {
+            return "/";
+        }
+
+        return path[0] == '/' ? path : $"/{path}";
     }
 
     private sealed record ProxyProblem(string Type, string Title, int Status, string Detail);
+
+    private sealed record RequestBodyReadResult(byte[]? InspectableBody, Stream? ReplayBody)
+    {
+        public static RequestBodyReadResult Uninspectable { get; } = new(null, null);
+    }
+
+    private sealed class PrefixReadStream : Stream
+    {
+        private readonly byte[] prefix;
+        private readonly Stream remainder;
+        private int prefixPosition;
+
+        public PrefixReadStream(byte[] prefix, Stream remainder)
+        {
+            this.prefix = prefix;
+            this.remainder = remainder;
+        }
+
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            Read(buffer.AsSpan(offset, count));
+
+        public override int Read(Span<byte> buffer)
+        {
+            int copied = CopyPrefix(buffer);
+            return copied > 0 ? copied : remainder.Read(buffer);
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            int copied = CopyPrefix(buffer.Span);
+            return copied > 0
+                ? copied
+                : await remainder.ReadAsync(buffer, cancellationToken);
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException();
+
+        private int CopyPrefix(Span<byte> destination)
+        {
+            int available = prefix.Length - prefixPosition;
+            int count = Math.Min(available, destination.Length);
+            if (count > 0)
+            {
+                prefix.AsSpan(prefixPosition, count).CopyTo(destination);
+                prefixPosition += count;
+            }
+
+            return count;
+        }
+    }
+
+    [LoggerMessage(
+        Level = LogLevel.Information,
+        Message = "Rewrote {Provider} history for {TriggerCount} trigger fields using {EditCount} text edits and removed {OpaqueBlockCount} opaque blocks.")]
+    private static partial void LogRewrite(
+        ILogger logger,
+        ProviderRequestKind provider,
+        int triggerCount,
+        int editCount,
+        int opaqueBlockCount);
+
+    [LoggerMessage(
+        Level = LogLevel.Information,
+        Message = "History rewrite audit matched {TriggerCount} trigger fields in a {Provider} request.")]
+    private static partial void LogAuditMatch(
+        ILogger logger,
+        ProviderRequestKind provider,
+        int triggerCount);
+
+    [LoggerMessage(
+        Level = LogLevel.Information,
+        Message = "Replayed a cached {Provider} history rewrite for {TriggerCount} trigger fields.")]
+    private static partial void LogCacheReplay(
+        ILogger logger,
+        ProviderRequestKind provider,
+        int triggerCount);
 
     [LoggerMessage(
         Level = LogLevel.Error,

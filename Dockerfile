@@ -16,6 +16,9 @@ RUN dotnet publish src/PinkUnicornProxy/PinkUnicornProxy.csproj \
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
 WORKDIR /app
 COPY --from=build /app ./
+RUN mkdir -p /data && chown $APP_UID /data && chmod 0700 /data
+ENV PinkUnicorn__HistoryRewrite__Cache__DatabasePath=/data/pink-unicorn-cache.db
+VOLUME ["/data"]
 USER $APP_UID
 EXPOSE 8080
 ENTRYPOINT ["dotnet", "PinkUnicornProxy.dll"]
